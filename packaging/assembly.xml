@@ -1,0 +1,21 @@
+<assembly xmlns="http://maven.apache.org/ASSEMBLY/2.2.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/ASSEMBLY/2.2.0 https://maven.apache.org/xsd/assembly-2.2.0.xsd">
+  <id>extension</id>
+  <formats><format>zip</format></formats>
+  <includeBaseDirectory>true</includeBaseDirectory>
+  <files>
+    <file><source>${project.build.directory}/g-earth-facts-${project.version}.jar</source><outputDirectory>extension</outputDirectory><destName>G-Earth-Facts.jar</destName></file>
+    <file><source>packaging/command.txt</source><outputDirectory>/</outputDirectory></file>
+    <file><source>README.md</source><outputDirectory>/</outputDirectory></file>
+    <file><source>LICENSE</source><outputDirectory>/</outputDirectory></file>
+    <file><source>THIRD-PARTY-NOTICES.md</source><outputDirectory>/</outputDirectory></file>
+  </files>
+  <fileSets>
+    <fileSet>
+      <directory>licenses</directory>
+      <outputDirectory>licenses</outputDirectory>
+      <includes><include>*.txt</include></includes>
+    </fileSet>
+  </fileSets>
+</assembly>
