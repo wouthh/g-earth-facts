@@ -124,6 +124,7 @@ def validate_package(zip_path: Path) -> dict[str, object]:
     if not zip_path.is_file():
         raise InstallError(f"Extension ZIP is missing: {zip_path}")
     names: set[tuple[str, ...]] = set()
+    members: dict[tuple[str, ...], zipfile.ZipInfo] = {}
     total = 0
     try:
         with zipfile.ZipFile(zip_path) as archive:
@@ -132,6 +133,7 @@ def validate_package(zip_path: Path) -> dict[str, object]:
                 if parts in names:
                     raise InstallError(f"Duplicate ZIP member: {name}")
                 names.add(parts)
+                members[parts] = info
                 total += max(0, info.file_size)
                 if total > MAX_PACKAGE_BYTES:
                     raise InstallError("Extension ZIP is too large")
@@ -149,6 +151,18 @@ def validate_package(zip_path: Path) -> dict[str, object]:
             if missing:
                 missing_text = ", ".join("/".join(parts) for parts in sorted(missing))
                 raise InstallError("Extension ZIP is missing: " + missing_text)
+            for parts in required:
+                info = members[parts]
+                mode = (info.external_attr >> 16) & 0xFFFF
+                if info.is_dir() or (mode and stat.S_ISDIR(mode)):
+                    raise InstallError(
+                        f"Extension ZIP member is not a regular file: {info.filename}"
+                    )
+                jar_parts = tuple(
+                    PurePosixPath(f"{PLUGIN_DIR}/extension/G-Earth-Facts.jar").parts
+                )
+                if parts == jar_parts and info.file_size == 0:
+                    raise InstallError("Extension JAR is empty")
             command = json.loads(archive.read(f"{PLUGIN_DIR}/command.txt").decode("utf-8"))
     except (KeyError, OSError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise InstallError("Extension ZIP is not a valid folder package") from exc
@@ -319,6 +333,7 @@ def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Pat
         raise InstallError(f"Steam profile parent is unavailable: {layout.profile.parent}")
     _require_directory(layout.profile, "Steam profile", allow_missing=True)
     _require_directory(layout.profile_extensions, "Steam Extensions directory", allow_missing=True)
+    _ensure_backup_root_safe(layout)
 
     shared_children = sorted(layout.shared_extensions.iterdir(), key=lambda path: path.name)
     expected_names = {PLUGIN_DIR, *(child.name for child in shared_children)}
@@ -391,14 +406,28 @@ def _paths_overlap(first: Path, second: Path) -> bool:
     return first == second or first.is_relative_to(second) or second.is_relative_to(first)
 
 
-def install(layout: Layout, zip_path: Path) -> dict[str, object]:
-    """Install one package, preserving existing entries and an upgrade backup."""
-    layout = _absolute_layout(layout)
-    validate_package(zip_path)
+def _ensure_profile_isolated(layout: Layout) -> None:
     if _paths_overlap(layout.profile, layout.shared_app):
         raise InstallError("Steam profile overlaps the shared G-Earth directory")
     if _paths_overlap(layout.profile, layout.shared_extensions):
         raise InstallError("Steam profile overlaps the shared Extensions directory")
+
+
+def _ensure_backup_root_safe(layout: Layout) -> None:
+    if _lexists(layout.backup_root) and (
+        layout.backup_root.is_symlink() or not layout.backup_root.is_dir()
+    ):
+        raise InstallError(
+            f"Steam backup directory must be a real directory: {layout.backup_root}"
+        )
+
+
+def install(layout: Layout, zip_path: Path) -> dict[str, object]:
+    """Install one package, preserving existing entries and an upgrade backup."""
+    layout = _absolute_layout(layout)
+    validate_package(zip_path)
+    _ensure_profile_isolated(layout)
+    _ensure_backup_root_safe(layout)
     _read_pending_rollback(layout)
     _read_pending_upgrade(layout)
     shared_children, cert_links, old_plugin = _preflight(layout)
@@ -477,6 +506,8 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
 def rollback(layout: Layout) -> dict[str, object]:
     """Restore the newest retained plugin backup without touching shared links."""
     layout = _absolute_layout(layout)
+    _ensure_profile_isolated(layout)
+    _ensure_backup_root_safe(layout)
     recovered = _read_pending_rollback(layout)
     if recovered is not None:
         _atomic_json(

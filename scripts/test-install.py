@@ -169,6 +169,37 @@ def main() -> None:
             raise AssertionError("installer accepted a Steam profile overlapping shared G-Earth")
         assert not (overlap.shared_app / "Extensions" / PLUGIN_DIR).exists()
 
+        rollback_overlap_root = root / "rollback-overlap"
+        rollback_overlap = make_layout(rollback_overlap_root)
+        install(rollback_overlap, first)
+        install(rollback_overlap, second)
+        overlapping_rollback = Layout(
+            rollback_overlap.shared_app,
+            rollback_overlap.shared_extensions,
+            rollback_overlap.shared_app,
+        )
+        try:
+            rollback(overlapping_rollback)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback accepted a Steam profile overlapping shared G-Earth")
+        assert not (rollback_overlap.shared_app / "Extensions" / PLUGIN_DIR).exists()
+
+        backup_link_root = root / "backup-link"
+        backup_link = make_layout(backup_link_root)
+        install(backup_link, first)
+        backup_target = backup_link_root / "backup-target"
+        backup_target.mkdir()
+        backup_link.backup_root.symlink_to(backup_target, target_is_directory=True)
+        try:
+            install(backup_link, second)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a symlinked backup directory")
+        assert (backup_link.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+
         duplicate = root / "duplicate.zip"
         with zipfile.ZipFile(duplicate, "w") as archive:
             archive.writestr(PLUGIN_DIR + "/command.txt", json.dumps(COMMAND))
@@ -183,6 +214,34 @@ def main() -> None:
             pass
         else:
             raise AssertionError("installer accepted normalized duplicate ZIP members")
+
+        directory_member = root / "directory-member.zip"
+        with zipfile.ZipFile(directory_member, "w") as archive:
+            archive.writestr(PLUGIN_DIR + "/command.txt", json.dumps(COMMAND))
+            archive.writestr(PLUGIN_DIR + "/extension/G-Earth-Facts.jar/", "")
+            archive.writestr(PLUGIN_DIR + "/README.md", "synthetic package")
+            archive.writestr(PLUGIN_DIR + "/LICENSE", "MIT")
+            archive.writestr(PLUGIN_DIR + "/THIRD-PARTY-NOTICES.md", "notices")
+        try:
+            validate_package(directory_member)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a directory in place of the extension JAR")
+
+        empty_jar = root / "empty-jar.zip"
+        with zipfile.ZipFile(empty_jar, "w") as archive:
+            archive.writestr(PLUGIN_DIR + "/command.txt", json.dumps(COMMAND))
+            archive.writestr(PLUGIN_DIR + "/extension/G-Earth-Facts.jar", b"")
+            archive.writestr(PLUGIN_DIR + "/README.md", "synthetic package")
+            archive.writestr(PLUGIN_DIR + "/LICENSE", "MIT")
+            archive.writestr(PLUGIN_DIR + "/THIRD-PARTY-NOTICES.md", "notices")
+        try:
+            validate_package(empty_jar)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted an empty extension JAR")
 
         bad_command = root / "bad-command.zip"
         with zipfile.ZipFile(bad_command, "w") as archive:

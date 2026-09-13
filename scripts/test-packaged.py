@@ -56,6 +56,7 @@ def main() -> None:
             try:
                 connection, _ = listener.accept()
                 with connection:
+                    connection.settimeout(5)
                     # HPacket(new HPacket(2)) on the public extension wire.
                     connection.sendall(struct.pack(">IH", 2, 2))
                     length = struct.unpack(">I", read_exact(connection, 4))[0]

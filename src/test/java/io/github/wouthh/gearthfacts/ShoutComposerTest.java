@@ -70,4 +70,12 @@ class ShoutComposerTest {
         assertEquals(16, parts.size());
         assertEquals(text, String.join("", parts));
     }
+
+    @Test
+    void fallsBackToHardSplitsWhenWordBoundariesWouldExceedPartLimit() {
+        String text = "x " + "x".repeat(1598);
+        List<String> parts = ShoutComposer.split(text);
+        assertEquals(16, parts.size());
+        assertEquals(text, String.join("", parts));
+    }
 }

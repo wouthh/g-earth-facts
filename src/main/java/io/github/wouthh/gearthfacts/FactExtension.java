@@ -31,6 +31,7 @@ public final class FactExtension extends Extension implements AutoCloseable {
     private final ScheduledExecutorService executor;
     private final FactScheduler scheduler;
     private final Object lifecycleLock = new Object();
+    private final Object snapshotLock = new Object();
     private volatile Settings settings;
     private volatile boolean origins;
     private volatile long roomId;
@@ -207,19 +208,27 @@ public final class FactExtension extends Extension implements AutoCloseable {
     }
 
     private void publishStatus(String status) {
-        PublisherSnapshot old = latest;
-        publish(
-                new PublisherSnapshot(
-                        old.running(),
-                        roomId,
-                        old.nextAt(),
-                        old.lastFact(),
-                        old.part(),
-                        old.parts(),
-                        status));
+        synchronized (snapshotLock) {
+            PublisherSnapshot old = latest;
+            publishLocked(
+                    new PublisherSnapshot(
+                            old.running(),
+                            roomId,
+                            old.nextAt(),
+                            old.lastFact(),
+                            old.part(),
+                            old.parts(),
+                            status));
+        }
     }
 
     private void publish(PublisherSnapshot value) {
+        synchronized (snapshotLock) {
+            publishLocked(value);
+        }
+    }
+
+    private void publishLocked(PublisherSnapshot value) {
         latest = value;
         FactsWindow current = window;
         if (current != null && !closed.get())
