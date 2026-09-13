@@ -27,5 +27,6 @@ package_info = validate_package(zip_path)
 if package_info["members"] < 8:
     raise SystemExit("Extension ZIP is missing expected package files")
 subprocess.run([sys.executable, str(ROOT / "scripts" / "test-install.py")], cwd=ROOT, check=True)
+subprocess.run([sys.executable, str(ROOT / "scripts" / "test-packaged.py")], cwd=ROOT, env=BUILD_ENV, check=True)
 subprocess.run(["git", "diff", "--check"], cwd=ROOT, check=True)
 print("G-Earth Facts local gate passed")
