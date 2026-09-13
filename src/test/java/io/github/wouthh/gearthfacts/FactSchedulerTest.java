@@ -282,17 +282,13 @@ class FactSchedulerTest {
 
     @Test
     void disconnectCancelsAnInFlightRequestAndRemainingParts() throws Exception {
-        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        ManualScheduledExecutor executor = new ManualScheduledExecutor();
         try {
             CompletableFuture<String> response = new CompletableFuture<>();
-            CountDownLatch requested = new CountDownLatch(1);
             var packets = new CopyOnWriteArrayList<gearth.protocol.HPacket>();
             FactScheduler scheduler =
                     new FactScheduler(
-                            key -> {
-                                requested.countDown();
-                                return response;
-                            },
+                            key -> response,
                             packet -> {
                                 packets.add(packet);
                                 return true;
@@ -303,10 +299,9 @@ class FactSchedulerTest {
                             ignored -> {});
             scheduler.roomChanged(1);
             scheduler.start("key", "", 1);
-            assertTrue(requested.await(200, TimeUnit.MILLISECONDS));
+            executor.runNextActive();
             scheduler.disconnect();
             response.complete("x ".repeat(120));
-            Thread.sleep(40);
             assertFalse(scheduler.isRunning());
             assertTrue(packets.isEmpty());
             scheduler.close();
