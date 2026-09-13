@@ -269,11 +269,22 @@ def _remove_owned_plugin(path: Path) -> None:
 def _restore_plugin_backup(layout: Layout, backup: Path) -> None:
     if not _known_plugin(backup):
         raise InstallError(f"Steam plugin backup is unavailable: {backup}")
-    _remove_owned_plugin(layout.plugin)
     restore = layout.profile_extensions / f".{PLUGIN_ID}.restore"
-    _remove_owned_plugin(restore)
-    shutil.copytree(backup, restore, symlinks=True)
-    os.replace(restore, layout.plugin)
+    if _lexists(restore):
+        raise InstallError(f"Steam restore staging path is occupied: {restore}")
+    _remove_owned_plugin(layout.plugin)
+    restore_created = False
+    try:
+        restore.mkdir(mode=0o700)
+        restore_created = True
+        shutil.copytree(backup, restore, symlinks=True, dirs_exist_ok=True)
+        if not _known_plugin(restore):
+            raise InstallError(f"Steam restore staging is incomplete: {restore}")
+        os.replace(restore, layout.plugin)
+    except Exception:
+        if restore_created and _lexists(restore):
+            _remove_owned_plugin(restore)
+        raise
 
 
 def _read_pending_upgrade(layout: Layout) -> Path | None:
@@ -285,9 +296,33 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
         raise InstallError(f"Pending upgrade marker is not a regular file: {pending}")
     try:
         state = json.loads(pending.read_text(encoding="utf-8"))
-        backup_name = state["backup"]
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
         raise InstallError(f"Pending upgrade marker is invalid: {pending}")
+    if not isinstance(state, dict) or state.get("schema") != 1:
+        raise InstallError(f"Pending upgrade marker is invalid: {pending}")
+    operation = state.get("operation", "upgrade")
+    if operation == "first-install":
+        plugin_name = state.get("plugin")
+        if not _valid_plugin_name(plugin_name) or plugin_name != layout.plugin.name:
+            raise InstallError(f"Pending upgrade marker is invalid: {pending}")
+        if _lexists(layout.plugin):
+            if layout.plugin.is_symlink() or not layout.plugin.is_dir():
+                raise InstallError(f"Steam plugin is unfamiliar while recovering: {layout.plugin}")
+            if _read_receipt_plugin_name(layout.profile) == plugin_name:
+                if not _known_plugin(layout.plugin):
+                    raise InstallError(
+                        f"Steam plugin is incomplete while recovering: {layout.plugin}"
+                    )
+                # The first install completed and only marker cleanup was interrupted.
+                pending.unlink()
+                return None
+            # The marker identifies this exact destination as an incomplete first install.
+            _remove_owned_plugin(layout.plugin)
+        pending.unlink()
+        return None
+    if operation != "upgrade":
+        raise InstallError(f"Pending upgrade marker is invalid: {pending}")
+    backup_name = state.get("backup")
     if (
         not isinstance(backup_name, str)
         or not backup_name
@@ -423,7 +458,7 @@ def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Pat
         source = layout.shared_app / name
         destination = layout.profile / name
         if _lexists(source):
-            if not source.is_file() and not source.is_symlink():
+            if not source.is_file():
                 raise InstallError(f"Shared certificate path is not a file: {source}")
             if _lexists(destination) and not _same_target(destination, source):
                 raise InstallError(f"Steam certificate-path collision: {destination}")
@@ -515,9 +550,9 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     _ensure_profile_isolated(layout)
     _ensure_backup_root_safe(layout)
     _ensure_receipt_safe(layout)
-    _require_receipt_for_existing_plugin(layout)
     _read_pending_rollback(layout)
     _read_pending_upgrade(layout)
+    _require_receipt_for_existing_plugin(layout)
     shared_children, cert_links, old_plugin = _preflight(layout)
     layout.profile.mkdir(parents=True, exist_ok=True)
     layout.profile_extensions.mkdir(parents=True, exist_ok=True)
@@ -529,8 +564,15 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     created_certs: list[Path] = []
     previous_receipt = layout.receipt.read_bytes() if layout.receipt.is_file() else None
     pending_written = False
+    first_install_marker = old_plugin is None and _read_receipt_plugin_name(layout.profile) is None
     try:
         stage_root = _extract_package(zip_path, stage_parent)
+        if first_install_marker:
+            _atomic_json(
+                layout.pending_upgrade,
+                {"schema": 1, "operation": "first-install", "plugin": layout.plugin.name},
+            )
+            pending_written = True
         if old_plugin is not None:
             layout.backup_root.mkdir(mode=0o700, exist_ok=True)
             backup = _backup_name(layout.backup_root)

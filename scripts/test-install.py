@@ -119,6 +119,44 @@ def main() -> None:
         assert (partial.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
         assert not partial.pending_upgrade.exists()
 
+        first_recovery_root = root / "first-install-recovery"
+        first_recovery = make_layout(first_recovery_root)
+        first_recovery.profile.mkdir(parents=True)
+        first_recovery.profile_extensions.mkdir()
+        partial_first = first_recovery.profile_extensions / PLUGIN_DIR
+        partial_first.mkdir()
+        (partial_first / "partial.txt").write_text("incomplete", encoding="utf-8")
+        first_recovery.pending_upgrade.write_text(
+            json.dumps(
+                {"schema": 1, "operation": "first-install", "plugin": PLUGIN_DIR}
+            ),
+            encoding="utf-8",
+        )
+        install(first_recovery, second)
+        assert (first_recovery.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
+        assert not first_recovery.pending_upgrade.exists()
+
+        restore_collision_root = root / "restore-collision"
+        restore_collision = make_layout(restore_collision_root)
+        install(restore_collision, first)
+        restore_collision.backup_root.mkdir()
+        retained_restore = restore_collision.backup_root / "interrupted-restore"
+        shutil.copytree(restore_collision.plugin, retained_restore)
+        shutil.rmtree(restore_collision.plugin)
+        restore_stage = restore_collision.profile_extensions / ".G-Earth-Facts.restore"
+        restore_stage.mkdir()
+        (restore_stage / "keep.txt").write_text("preserve", encoding="utf-8")
+        restore_collision.pending_upgrade.write_text(
+            json.dumps({"schema": 1, "backup": retained_restore.name}), encoding="utf-8"
+        )
+        try:
+            install(restore_collision, second)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer deleted an occupied restore staging path")
+        assert (restore_stage / "keep.txt").read_text(encoding="utf-8") == "preserve"
+
         legacy_root = root / "legacy-version"
         legacy = make_layout(legacy_root)
         install(legacy, first)
@@ -269,6 +307,30 @@ def main() -> None:
         else:
             raise AssertionError("installer accepted a symlinked backup directory")
         assert (backup_link.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+
+        broken_certificate_root = root / "broken-certificate"
+        broken_certificate = make_layout(broken_certificate_root)
+        (broken_certificate.shared_app / "gearth-nitro-v2.crt").symlink_to(
+            broken_certificate_root / "missing.crt"
+        )
+        try:
+            install(broken_certificate, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a broken shared certificate link")
+        assert not broken_certificate.plugin.exists()
+
+        directory_certificate_root = root / "directory-certificate"
+        directory_certificate = make_layout(directory_certificate_root)
+        (directory_certificate.shared_app / "gearth-nitro-v2.key").mkdir()
+        try:
+            install(directory_certificate, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a directory certificate path")
+        assert not directory_certificate.plugin.exists()
 
         copy_failure_root = root / "copy-failure"
         copy_failure = make_layout(copy_failure_root)

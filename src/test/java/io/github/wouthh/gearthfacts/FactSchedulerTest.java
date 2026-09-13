@@ -254,6 +254,7 @@ class FactSchedulerTest {
             scheduler.stop();
 
             CompletableFuture<String> auth = new CompletableFuture<>();
+            CountDownLatch authStopped = new CountDownLatch(1);
             FactScheduler stopped =
                     new FactScheduler(
                             key -> auth,
@@ -261,12 +262,17 @@ class FactSchedulerTest {
                             executor,
                             Duration.ofMillis(10),
                             Duration.ofMillis(10),
-                            ignored -> {});
+                            snapshot -> {
+                                if (!snapshot.running()
+                                        && snapshot.status()
+                                                .equals("API key rejected; publishing stopped"))
+                                    authStopped.countDown();
+                            });
             stopped.roomChanged(1);
             stopped.start("key", "", 1);
             auth.completeExceptionally(
                     new FactFailure(FactFailure.Kind.AUTHENTICATION, "rejected"));
-            Thread.sleep(40);
+            assertTrue(authStopped.await(1, TimeUnit.SECONDS));
             assertFalse(stopped.isRunning());
             stopped.close();
         } finally {
