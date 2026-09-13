@@ -8,9 +8,8 @@ The **Prefix** field is saved on every edit, including clearing the field. Its
 default value is the empty string, so a fact is sent exactly as returned by
 API Ninjas. To add the familiar wording, enter this exact prefix:
 
-```text
-Did you know? 
-```
+The exact value is `Did you know? `; the space before the closing backtick is
+part of the prefix.
 
 The trailing space is part of the value. Prefix text is combined with the fact
 without inserting a separator. Only Latin-1 text can be sent by the Origins
