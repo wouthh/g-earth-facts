@@ -31,12 +31,15 @@ public final class FactExtension extends Extension implements AutoCloseable {
     private final ScheduledExecutorService executor;
     private final FactScheduler scheduler;
     private final Object lifecycleLock = new Object();
+    private final Object connectionLock = new Object();
     private final Object snapshotLock = new Object();
     private volatile Settings settings;
     private volatile boolean origins;
     private volatile long roomId;
     private volatile FactsWindow window;
     private volatile PublisherSnapshot latest = PublisherSnapshot.stopped("Waiting for Origins");
+    private long connectionGeneration;
+    private long roomGeneration;
 
     public FactExtension(String[] args) throws IOException {
         super(args);
@@ -62,11 +65,20 @@ public final class FactExtension extends Extension implements AutoCloseable {
                 (host, port, version, identifier, client) -> {
                     // A reconnect is a new publishing generation.  Requiring a fresh Start
                     // avoids carrying a request or countdown across connection boundaries.
-                    origins = false;
-                    roomId = 0;
+                    final long connectionToken;
+                    synchronized (connectionLock) {
+                        connectionToken = ++connectionGeneration;
+                        roomGeneration++;
+                        origins = false;
+                        roomId = 0;
+                    }
                     scheduler.disconnect();
-                    origins = OriginsProtocol.isOrigins(host, client);
-                    roomId = 0;
+                    boolean connectedToOrigins = OriginsProtocol.isOrigins(host, client);
+                    synchronized (connectionLock) {
+                        if (connectionGeneration != connectionToken) return;
+                        origins = connectedToOrigins;
+                        roomId = 0;
+                    }
                     publish(
                             new PublisherSnapshot(
                                     false,
@@ -75,7 +87,7 @@ public final class FactExtension extends Extension implements AutoCloseable {
                                     latest.lastFact(),
                                     0,
                                     0,
-                                    origins
+                                    connectedToOrigins
                                             ? "Connected; waiting for a room"
                                             : "Unsupported client; Origins/Shockwave is required"));
                 });
@@ -85,59 +97,103 @@ public final class FactExtension extends Extension implements AutoCloseable {
     }
 
     private boolean sendShout(HPacket packet) {
-        if (closed.get()
-                || !origins
-                || roomId <= 0
-                || packet.getFormat() != HPacketFormat.WEDGIE_OUTGOING
-                || packet.headerId() != OriginsProtocol.SHOUT_HEADER) return false;
-        try {
-            return sendToServer(packet);
-        } catch (RuntimeException e) {
-            return false;
+        synchronized (connectionLock) {
+            if (closed.get()
+                    || !origins
+                    || roomId <= 0
+                    || packet.getFormat() != HPacketFormat.WEDGIE_OUTGOING
+                    || packet.headerId() != OriginsProtocol.SHOUT_HEADER) return false;
+            try {
+                return sendToServer(packet);
+            } catch (RuntimeException e) {
+                return false;
+            }
         }
     }
 
     private void roomReady(HMessage message) {
-        if (!origins) return;
+        final long connectionToken;
         if (message.isBlocked()) {
-            roomId = 0;
+            synchronized (connectionLock) {
+                if (!origins) return;
+                roomGeneration++;
+                roomId = 0;
+                connectionToken = connectionGeneration;
+            }
             scheduler.roomChanged(0);
+            synchronized (connectionLock) {
+                if (connectionGeneration != connectionToken) return;
+            }
             return;
         }
         OptionalLong parsed = OriginsProtocol.roomId(message.getPacket());
         if (parsed.isEmpty()) {
-            roomId = 0;
+            synchronized (connectionLock) {
+                if (!origins) return;
+                roomGeneration++;
+                roomId = 0;
+                connectionToken = connectionGeneration;
+            }
             scheduler.roomChanged(0);
             publishStatus("Malformed room context; publishing paused");
             return;
         }
         long newRoomId = parsed.getAsLong();
-        long previousRoomId = roomId;
+        final long roomToken;
+        final long previousRoomId;
+        synchronized (connectionLock) {
+            if (!origins) return;
+            connectionToken = connectionGeneration;
+            previousRoomId = roomId;
+            if (previousRoomId != newRoomId) {
+                roomToken = ++roomGeneration;
+                // Invalidate the send guard before waiting for scheduler cancellation.
+                roomId = 0;
+            } else {
+                roomToken = roomGeneration;
+            }
+        }
         if (previousRoomId != newRoomId) {
-            // Close the send guard before waiting for the scheduler lock.  An old
-            // multipart callback must not be able to use the new room metadata.
-            roomId = 0;
             scheduler.roomChanged(0);
             scheduler.roomChanged(newRoomId);
-            roomId = newRoomId;
+            synchronized (connectionLock) {
+                if (connectionGeneration != connectionToken || roomGeneration != roomToken) return;
+                origins = true;
+                roomId = newRoomId;
+            }
             publishStatus("Room " + newRoomId + " is ready");
             return;
         }
         scheduler.roomChanged(newRoomId);
+        synchronized (connectionLock) {
+            if (connectionGeneration != connectionToken || roomGeneration != roomToken) return;
+        }
         publishStatus("Room " + newRoomId + " is ready");
     }
 
     private void navigation(HMessage message) {
-        if (!origins || message.isBlocked()) return;
-        roomId = 0;
+        final long connectionToken;
+        synchronized (connectionLock) {
+            if (!origins || message.isBlocked()) return;
+            roomGeneration++;
+            roomId = 0;
+            connectionToken = connectionGeneration;
+        }
         scheduler.roomChanged(0);
+        synchronized (connectionLock) {
+            if (connectionGeneration != connectionToken) return;
+        }
         publishStatus("Leaving room; waiting for the next room");
     }
 
     @Override
     public void onEndConnection() {
-        origins = false;
-        roomId = 0;
+        synchronized (connectionLock) {
+            connectionGeneration++;
+            roomGeneration++;
+            origins = false;
+            roomId = 0;
+        }
         scheduler.disconnect();
         publishStatus("Disconnected; publishing stopped");
     }
@@ -260,7 +316,11 @@ public final class FactExtension extends Extension implements AutoCloseable {
     public void close() {
         FactsWindow current;
         synchronized (lifecycleLock) {
-            if (!closed.compareAndSet(false, true)) return;
+            synchronized (connectionLock) {
+                if (!closed.compareAndSet(false, true)) return;
+                origins = false;
+                roomId = 0;
+            }
             current = window;
         }
         scheduler.close();

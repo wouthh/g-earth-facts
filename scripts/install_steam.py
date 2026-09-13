@@ -451,6 +451,15 @@ def _backup_timestamp(path: Path) -> str:
 
 
 def _absolute_layout(layout: Layout) -> Layout:
+    paths = (
+        (layout.profile, "Steam profile"),
+        (layout.shared_extensions, "shared Extensions directory"),
+        (layout.shared_app, "shared G-Earth directory"),
+    )
+    for path, label in paths:
+        expanded = path.expanduser()
+        if _lexists(expanded) and expanded.is_symlink():
+            raise InstallError(f"{label} must not be a symlink: {expanded}")
     return Layout(
         layout.profile.expanduser().resolve(),
         layout.shared_extensions.expanduser().resolve(),

@@ -243,6 +243,19 @@ def main() -> None:
             raise AssertionError("installer accepted a backup root overlapping shared G-Earth")
         assert not backup_overlap.plugin.exists()
 
+        profile_symlink_root = root / "profile-symlink"
+        profile_symlink = make_layout(profile_symlink_root)
+        real_profile = profile_symlink_root / "real-profile"
+        real_profile.mkdir()
+        profile_symlink.profile.symlink_to(real_profile, target_is_directory=True)
+        try:
+            install(profile_symlink, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a symlinked Steam profile")
+        assert not (real_profile / "Extensions" / PLUGIN_DIR).exists()
+
         backup_link_root = root / "backup-link"
         backup_link = make_layout(backup_link_root)
         install(backup_link, first)
