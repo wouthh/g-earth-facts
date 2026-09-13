@@ -99,17 +99,24 @@ def _valid_plugin_name(name: object) -> bool:
     )
 
 
-def _receipt_plugin_name(profile: Path) -> str:
-    """Return the previously managed folder, or this build's default name."""
+def _read_receipt_plugin_name(profile: Path) -> str | None:
+    """Read the managed folder name from a valid installation receipt."""
     receipt = profile / ".g-earth-facts-install.json"
     if not _lexists(receipt) or receipt.is_symlink() or not receipt.is_file():
-        return PLUGIN_DIR
+        return None
     try:
         state = json.loads(receipt.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return PLUGIN_DIR
-    name = state.get("plugin") if isinstance(state, dict) else None
-    return name if _valid_plugin_name(name) else PLUGIN_DIR
+        return None
+    if not isinstance(state, dict) or state.get("schema") != 1:
+        return None
+    name = state.get("plugin")
+    return name if _valid_plugin_name(name) else None
+
+
+def _receipt_plugin_name(profile: Path) -> str:
+    """Return the previously managed folder, or this build's default name."""
+    return _read_receipt_plugin_name(profile) or PLUGIN_DIR
 
 
 def _require_directory(path: Path, label: str, allow_missing: bool = False) -> None:
@@ -126,6 +133,14 @@ def _ensure_receipt_safe(layout: Layout) -> None:
         layout.receipt.is_symlink() or not layout.receipt.is_file()
     ):
         raise InstallError(f"Steam installation receipt is not a regular file: {layout.receipt}")
+
+
+def _require_receipt_for_existing_plugin(layout: Layout) -> None:
+    """Refuse to adopt a pre-existing plugin without durable ownership proof."""
+    if _lexists(layout.plugin) and _read_receipt_plugin_name(layout.profile) != layout.plugin.name:
+        raise InstallError(
+            "An existing G-Earth Facts plugin requires a valid installation receipt"
+        )
 
 
 def _same_target(link: Path, source: Path) -> bool:
@@ -374,6 +389,8 @@ def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Pat
     _require_directory(layout.profile, "Steam profile", allow_missing=True)
     _require_directory(layout.profile_extensions, "Steam Extensions directory", allow_missing=True)
     _ensure_backup_root_safe(layout)
+    _ensure_receipt_safe(layout)
+    _require_receipt_for_existing_plugin(layout)
 
     shared_children = sorted(layout.shared_extensions.iterdir(), key=lambda path: path.name)
     managed_name = layout.plugin.name
@@ -412,7 +429,6 @@ def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Pat
                 raise InstallError(f"Steam certificate-path collision: {destination}")
             if not _lexists(destination):
                 cert_links.append((destination, source))
-    _ensure_receipt_safe(layout)
     return shared_children, cert_links, old_plugin
 
 
@@ -498,6 +514,8 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     validate_package(zip_path)
     _ensure_profile_isolated(layout)
     _ensure_backup_root_safe(layout)
+    _ensure_receipt_safe(layout)
+    _require_receipt_for_existing_plugin(layout)
     _read_pending_rollback(layout)
     _read_pending_upgrade(layout)
     shared_children, cert_links, old_plugin = _preflight(layout)
@@ -505,6 +523,7 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     layout.profile_extensions.mkdir(parents=True, exist_ok=True)
     stage_parent = Path(tempfile.mkdtemp(prefix=".g-earth-facts-stage-", dir=layout.profile.parent))
     backup: Path | None = None
+    backup_created = False
     plugin_replaced = False
     created_links: list[Path] = []
     created_certs: list[Path] = []
@@ -515,7 +534,14 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
         if old_plugin is not None:
             layout.backup_root.mkdir(mode=0o700, exist_ok=True)
             backup = _backup_name(layout.backup_root)
-            shutil.copytree(old_plugin, backup, symlinks=True)
+            try:
+                backup.mkdir(mode=0o700)
+            except FileExistsError as exc:
+                raise InstallError(f"Steam backup path already exists: {backup}") from exc
+            backup_created = True
+            shutil.copytree(old_plugin, backup, symlinks=True, dirs_exist_ok=True)
+            if not _known_plugin(backup):
+                raise InstallError(f"Steam plugin backup is incomplete: {backup}")
             pending_written = True
             _atomic_json(layout.pending_upgrade, {"schema": 1, "backup": backup.name})
             shutil.rmtree(old_plugin)
@@ -554,7 +580,7 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
                     "Steam installation failed; pending recovery marker was retained"
                 ) from recovery
             layout.pending_upgrade.unlink(missing_ok=True)
-        elif backup is not None and _lexists(backup):
+        elif backup_created and backup is not None and _lexists(backup):
             # A failed copy can leave a partial timestamped backup even though no
             # transaction marker was published.  Remove that owned destination so
             # rollback cannot mistake it for a usable retained version.
@@ -584,6 +610,7 @@ def rollback(layout: Layout) -> dict[str, object]:
     _ensure_profile_isolated(layout)
     _ensure_backup_root_safe(layout)
     _ensure_receipt_safe(layout)
+    _require_receipt_for_existing_plugin(layout)
     recovered = _read_pending_rollback(layout)
     if recovered is not None:
         _atomic_json(

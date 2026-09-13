@@ -6,34 +6,38 @@ import io.github.wouthh.gearthfacts.protocol.ShoutComposer;
 import io.github.wouthh.gearthfacts.runtime.FactFailure;
 import io.github.wouthh.gearthfacts.runtime.FactScheduler;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Delayed;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 class FactSchedulerTest {
     @Test
     void firstFactWaitsAndRoomChangeCancelsOldGeneration() throws Exception {
-        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        ManualScheduledExecutor executor = new ManualScheduledExecutor();
         try {
-            CountDownLatch fetchCalled = new CountDownLatch(1);
-            CountDownLatch sent = new CountDownLatch(1);
             AtomicInteger requests = new AtomicInteger();
             var packets = new CopyOnWriteArrayList<gearth.protocol.HPacket>();
             FactScheduler scheduler =
                     new FactScheduler(
                             key -> {
                                 requests.incrementAndGet();
-                                fetchCalled.countDown();
                                 return CompletableFuture.completedFuture("fact");
                             },
                             packet -> {
                                 packets.add(packet);
-                                sent.countDown();
                                 return true;
                             },
                             executor,
@@ -41,17 +45,179 @@ class FactSchedulerTest {
                             Duration.ofMillis(10),
                             ignored -> {});
             scheduler.roomChanged(1);
-            scheduler.start("key", "", 1);
-            scheduler.start("key", "ignored", 1);
-            assertFalse(fetchCalled.await(20, TimeUnit.MILLISECONDS));
+            assertTrue(scheduler.start("key", "", 1));
+            assertTrue(scheduler.start("key", "ignored", 1));
+            assertEquals(1, executor.activeTaskCount());
             scheduler.roomChanged(2);
-            assertFalse(sent.await(55, TimeUnit.MILLISECONDS));
-            assertTrue(sent.await(200, TimeUnit.MILLISECONDS));
+            assertTrue(packets.isEmpty());
+            assertEquals(1, executor.activeTaskCount());
+            executor.runNextActive();
             assertEquals("fact", ShoutComposer.decode(packets.getFirst()));
             assertEquals(1, requests.get());
             scheduler.close();
         } finally {
             executor.shutdownNow();
+        }
+    }
+
+    private static final class ManualScheduledExecutor extends AbstractExecutorService
+            implements ScheduledExecutorService {
+        private final List<ManualTask> tasks = new ArrayList<>();
+        private boolean shutdown;
+
+        @Override
+        public synchronized ScheduledFuture<?> schedule(
+                Runnable command, long delay, TimeUnit unit) {
+            if (shutdown) throw new RejectedExecutionException();
+            ManualTask task = new ManualTask(command);
+            tasks.add(task);
+            return task;
+        }
+
+        @Override
+        public <V> ScheduledFuture<V> schedule(
+                java.util.concurrent.Callable<V> callable, long delay, TimeUnit unit) {
+            throw new UnsupportedOperationException();
+        }
+
+        void runNextActive() {
+            ManualTask next = null;
+            synchronized (this) {
+                for (var iterator = tasks.iterator(); iterator.hasNext(); ) {
+                    ManualTask candidate = iterator.next();
+                    if (candidate.isCancelled() || candidate.isDone()) {
+                        iterator.remove();
+                    } else {
+                        iterator.remove();
+                        next = candidate;
+                        break;
+                    }
+                }
+            }
+            if (next == null) throw new AssertionError("no active scheduled task");
+            next.runTask();
+        }
+
+        synchronized int activeTaskCount() {
+            int count = 0;
+            for (ManualTask task : tasks) if (!task.isCancelled() && !task.isDone()) count++;
+            return count;
+        }
+
+        @Override
+        public void execute(Runnable command) {
+            synchronized (this) {
+                if (shutdown) throw new RejectedExecutionException();
+            }
+            command.run();
+        }
+
+        @Override
+        public synchronized void shutdown() {
+            shutdown = true;
+        }
+
+        @Override
+        public synchronized List<Runnable> shutdownNow() {
+            shutdown = true;
+            List<Runnable> pending = new ArrayList<>();
+            for (ManualTask task : tasks) {
+                if (!task.isDone()) {
+                    pending.add(task.command);
+                    task.cancel(false);
+                }
+            }
+            tasks.clear();
+            return pending;
+        }
+
+        @Override
+        public synchronized boolean isShutdown() {
+            return shutdown;
+        }
+
+        @Override
+        public synchronized boolean isTerminated() {
+            return shutdown && tasks.stream().allMatch(ManualTask::isDone);
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) {
+            return isTerminated();
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleAtFixedRate(
+                Runnable command, long initialDelay, long period, TimeUnit unit) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public ScheduledFuture<?> scheduleWithFixedDelay(
+                Runnable command, long initialDelay, long delay, TimeUnit unit) {
+            throw new UnsupportedOperationException();
+        }
+
+        private static final class ManualTask implements ScheduledFuture<Object> {
+            private final Runnable command;
+            private boolean cancelled;
+            private boolean done;
+
+            private ManualTask(Runnable command) {
+                this.command = command;
+            }
+
+            private synchronized void runTask() {
+                if (cancelled || done) return;
+                try {
+                    command.run();
+                } finally {
+                    done = true;
+                }
+            }
+
+            @Override
+            public synchronized boolean cancel(boolean mayInterruptIfRunning) {
+                if (done) return false;
+                cancelled = true;
+                done = true;
+                return true;
+            }
+
+            @Override
+            public synchronized boolean isCancelled() {
+                return cancelled;
+            }
+
+            @Override
+            public synchronized boolean isDone() {
+                return done;
+            }
+
+            @Override
+            public Object get() throws InterruptedException, ExecutionException {
+                synchronized (this) {
+                    if (!done) throw new IllegalStateException("task has not been run");
+                    if (cancelled) throw new java.util.concurrent.CancellationException();
+                    return null;
+                }
+            }
+
+            @Override
+            public Object get(long timeout, TimeUnit unit)
+                    throws InterruptedException, ExecutionException, TimeoutException {
+                return get();
+            }
+
+            @Override
+            public long getDelay(TimeUnit unit) {
+                return 0;
+            }
+
+            @Override
+            public int compareTo(Delayed other) {
+                return 0;
+            }
         }
     }
 

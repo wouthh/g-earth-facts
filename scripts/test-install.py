@@ -289,6 +289,40 @@ def main() -> None:
         assert (copy_failure.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
         assert not list(copy_failure.backup_root.iterdir())
 
+        backup_name_collision_root = root / "backup-name-collision"
+        backup_name_collision = make_layout(backup_name_collision_root)
+        install(backup_name_collision, first)
+        occupied_backup = backup_name_collision.backup_root / "G-Earth-Facts-0.1.0-20990101T010000.000000Z"
+        occupied_backup.mkdir(parents=True)
+        (occupied_backup / "keep.txt").write_text("preserve", encoding="utf-8")
+        with patch("install_steam._backup_name", return_value=occupied_backup):
+            try:
+                install(backup_name_collision, second)
+            except InstallError:
+                pass
+            else:
+                raise AssertionError("installer overwrote a colliding backup path")
+        assert (occupied_backup / "keep.txt").read_text(encoding="utf-8") == "preserve"
+        assert (backup_name_collision.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+
+        missing_receipt_root = root / "missing-receipt"
+        missing_receipt = make_layout(missing_receipt_root)
+        install(missing_receipt, first)
+        missing_receipt.receipt.unlink()
+        try:
+            install(missing_receipt, second)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer adopted a plugin without its receipt")
+        assert (missing_receipt.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+        try:
+            rollback(missing_receipt)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback adopted a plugin without its receipt")
+
         receipt_collision_root = root / "receipt-collision"
         receipt_collision = make_layout(receipt_collision_root)
         install(receipt_collision, first)
