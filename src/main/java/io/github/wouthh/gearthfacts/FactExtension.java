@@ -115,7 +115,10 @@ public final class FactExtension extends Extension implements AutoCloseable {
             // multipart callback must not be able to use the new room metadata.
             roomId = 0;
             scheduler.roomChanged(0);
+            scheduler.roomChanged(newRoomId);
             roomId = newRoomId;
+            publishStatus("Room " + newRoomId + " is ready");
+            return;
         }
         scheduler.roomChanged(newRoomId);
         publishStatus("Room " + newRoomId + " is ready");
