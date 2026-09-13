@@ -272,16 +272,20 @@ def _restore_plugin_backup(layout: Layout, backup: Path) -> None:
     restore = layout.profile_extensions / f".{PLUGIN_ID}.restore"
     if _lexists(restore):
         raise InstallError(f"Steam restore staging path is occupied: {restore}")
-    _remove_owned_plugin(layout.plugin)
     restore_created = False
+    active_removed = False
     try:
         restore.mkdir(mode=0o700)
         restore_created = True
         shutil.copytree(backup, restore, symlinks=True, dirs_exist_ok=True)
         if not _known_plugin(restore):
             raise InstallError(f"Steam restore staging is incomplete: {restore}")
+        _remove_owned_plugin(layout.plugin)
+        active_removed = True
         os.replace(restore, layout.plugin)
     except Exception:
+        if active_removed and not _lexists(layout.plugin) and _known_plugin(restore):
+            os.replace(restore, layout.plugin)
         if restore_created and _lexists(restore):
             _remove_owned_plugin(restore)
         raise
@@ -551,7 +555,7 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     _ensure_backup_root_safe(layout)
     _ensure_receipt_safe(layout)
     _read_pending_rollback(layout)
-    _read_pending_upgrade(layout)
+    recovered_backup = _read_pending_upgrade(layout)
     _require_receipt_for_existing_plugin(layout)
     shared_children, cert_links, old_plugin = _preflight(layout)
     layout.profile.mkdir(parents=True, exist_ok=True)
@@ -574,18 +578,25 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
             )
             pending_written = True
         if old_plugin is not None:
-            layout.backup_root.mkdir(mode=0o700, exist_ok=True)
-            backup = _backup_name(layout.backup_root)
-            try:
-                backup.mkdir(mode=0o700)
-            except FileExistsError as exc:
-                raise InstallError(f"Steam backup path already exists: {backup}") from exc
-            backup_created = True
-            shutil.copytree(old_plugin, backup, symlinks=True, dirs_exist_ok=True)
-            if not _known_plugin(backup):
-                raise InstallError(f"Steam plugin backup is incomplete: {backup}")
-            pending_written = True
-            _atomic_json(layout.pending_upgrade, {"schema": 1, "backup": backup.name})
+            if recovered_backup is not None:
+                # Recovery already retained the pre-upgrade plugin. Reuse that
+                # backup so a retry cannot make rollback restore the replacement.
+                backup = recovered_backup
+                _atomic_json(layout.pending_upgrade, {"schema": 1, "backup": backup.name})
+                pending_written = True
+            else:
+                layout.backup_root.mkdir(mode=0o700, exist_ok=True)
+                backup = _backup_name(layout.backup_root)
+                try:
+                    backup.mkdir(mode=0o700)
+                except FileExistsError as exc:
+                    raise InstallError(f"Steam backup path already exists: {backup}") from exc
+                backup_created = True
+                shutil.copytree(old_plugin, backup, symlinks=True, dirs_exist_ok=True)
+                if not _known_plugin(backup):
+                    raise InstallError(f"Steam plugin backup is incomplete: {backup}")
+                pending_written = True
+                _atomic_json(layout.pending_upgrade, {"schema": 1, "backup": backup.name})
             shutil.rmtree(old_plugin)
         os.replace(stage_root, layout.plugin)
         plugin_replaced = True

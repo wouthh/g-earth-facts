@@ -105,6 +105,18 @@ def main() -> None:
         assert (recover.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
         assert not recover.pending_upgrade.exists()
 
+        exposed_root = root / "exposed-upgrade"
+        exposed = make_layout(exposed_root)
+        install(exposed, first)
+        install(exposed, second)
+        original_backup = next(path for path in exposed.backup_root.iterdir() if path.is_dir())
+        exposed.pending_upgrade.write_text(
+            json.dumps({"schema": 1, "backup": original_backup.name}), encoding="utf-8"
+        )
+        install(exposed, second)
+        rollback(exposed)
+        assert (exposed.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+
         partial_root = root / "partial-recover"
         partial = make_layout(partial_root)
         install(partial, first)
