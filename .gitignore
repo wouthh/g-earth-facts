@@ -1,0 +1,11 @@
+.build/
+target/
+.idea/
+*.iml
+*.log
+settings.properties
+**/settings.properties
+*.class
+*.jar
+*.zip
+__pycache__/
