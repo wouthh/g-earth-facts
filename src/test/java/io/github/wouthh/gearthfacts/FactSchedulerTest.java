@@ -12,6 +12,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 class FactSchedulerTest {
@@ -21,10 +22,12 @@ class FactSchedulerTest {
         try {
             CountDownLatch fetchCalled = new CountDownLatch(1);
             CountDownLatch sent = new CountDownLatch(1);
+            AtomicInteger requests = new AtomicInteger();
             var packets = new CopyOnWriteArrayList<gearth.protocol.HPacket>();
             FactScheduler scheduler =
                     new FactScheduler(
                             key -> {
+                                requests.incrementAndGet();
                                 fetchCalled.countDown();
                                 return CompletableFuture.completedFuture("fact");
                             },
@@ -38,11 +41,13 @@ class FactSchedulerTest {
                             Duration.ofMillis(10),
                             ignored -> {});
             scheduler.start("key", "", 1);
+            scheduler.start("key", "ignored", 1);
             assertFalse(fetchCalled.await(20, TimeUnit.MILLISECONDS));
             scheduler.roomChanged(2);
             assertFalse(sent.await(55, TimeUnit.MILLISECONDS));
             assertTrue(sent.await(200, TimeUnit.MILLISECONDS));
             assertEquals("fact", ShoutComposer.decode(packets.getFirst()));
+            assertEquals(1, requests.get());
             scheduler.close();
         } finally {
             executor.shutdownNow();
@@ -95,6 +100,40 @@ class FactSchedulerTest {
             Thread.sleep(40);
             assertFalse(stopped.isRunning());
             stopped.close();
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void disconnectCancelsAnInFlightRequestAndRemainingParts() throws Exception {
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        try {
+            CompletableFuture<String> response = new CompletableFuture<>();
+            CountDownLatch requested = new CountDownLatch(1);
+            var packets = new CopyOnWriteArrayList<gearth.protocol.HPacket>();
+            FactScheduler scheduler =
+                    new FactScheduler(
+                            key -> {
+                                requested.countDown();
+                                return response;
+                            },
+                            packet -> {
+                                packets.add(packet);
+                                return true;
+                            },
+                            executor,
+                            Duration.ofMillis(5),
+                            Duration.ofMillis(5),
+                            ignored -> {});
+            scheduler.start("key", "", 1);
+            assertTrue(requested.await(200, TimeUnit.MILLISECONDS));
+            scheduler.disconnect();
+            response.complete("x ".repeat(120));
+            Thread.sleep(40);
+            assertFalse(scheduler.isRunning());
+            assertTrue(packets.isEmpty());
+            scheduler.close();
         } finally {
             executor.shutdownNow();
         }

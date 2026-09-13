@@ -69,6 +69,17 @@ def main() -> None:
         assert not (layout.shared_extensions / PLUGIN_DIR).exists()
         assert result["backup"] is None
 
+        invalid = root / "invalid.zip"
+        with zipfile.ZipFile(invalid, "w") as archive:
+            archive.writestr(PLUGIN_DIR + "/command.txt", "not json")
+        try:
+            install(layout, invalid)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted an invalid replacement package")
+        assert (layout.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+
         install(layout, second)
         assert (layout.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
         backup = Path(next(path for path in layout.backup_root.iterdir() if path.is_dir()))

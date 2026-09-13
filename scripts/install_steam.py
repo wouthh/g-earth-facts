@@ -251,6 +251,7 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     layout.profile_extensions.mkdir(parents=True, exist_ok=True)
     stage_parent = Path(tempfile.mkdtemp(prefix=".g-earth-facts-stage-", dir=layout.profile.parent))
     backup: Path | None = None
+    plugin_replaced = False
     created_links: list[Path] = []
     created_certs: list[Path] = []
     previous_receipt = layout.receipt.read_bytes() if layout.receipt.is_file() else None
@@ -262,6 +263,7 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
             shutil.copytree(old_plugin, backup, symlinks=True)
             shutil.rmtree(old_plugin)
         os.replace(stage_root, layout.plugin)
+        plugin_replaced = True
         for child in shared_children:
             destination = layout.profile_extensions / child.name
             if not _lexists(destination):
@@ -285,7 +287,7 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
         for path in [*created_links, *created_certs]:
             if _lexists(path):
                 path.unlink()
-        if _lexists(layout.plugin):
+        if plugin_replaced and _lexists(layout.plugin):
             shutil.rmtree(layout.plugin)
         if backup is not None and _lexists(backup) and not _lexists(layout.plugin):
             shutil.move(backup, layout.plugin)

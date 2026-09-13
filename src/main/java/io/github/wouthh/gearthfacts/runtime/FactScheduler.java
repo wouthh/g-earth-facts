@@ -164,6 +164,12 @@ public final class FactScheduler implements AutoCloseable {
         synchronized (lock) {
             future = inFlight;
         }
+        if (future == null) {
+            synchronized (lock) {
+                if (token == generation) handleFailureLocked(token, new IllegalStateException());
+            }
+            return;
+        }
         future.whenCompleteAsync(
                 (fact, failure) -> factReady(token, sequencePrefix, fact, failure), executor);
     }
