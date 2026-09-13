@@ -88,7 +88,9 @@ public final class SettingsStore implements AutoCloseable {
         properties.setProperty("prefix", settings.prefix());
         ByteArrayOutputStream output = new ByteArrayOutputStream();
         properties.store(output, "G-Earth Facts local settings");
-        atomicWrite(settingsFile, output.toByteArray());
+        byte[] serialized = output.toByteArray();
+        if (serialized.length > MAX_BYTES) throw new IOException("Settings are too large");
+        atomicWrite(settingsFile, serialized);
     }
 
     private void atomicWrite(Path target, byte[] bytes) throws IOException {

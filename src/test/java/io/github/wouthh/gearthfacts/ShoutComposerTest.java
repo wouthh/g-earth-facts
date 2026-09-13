@@ -62,4 +62,12 @@ class ShoutComposerTest {
                                                                 * ShoutComposer.MAX_PARTS
                                                         + 1)));
     }
+
+    @Test
+    void doesNotSpendAChunkOnOnlyLeadingWhitespace() {
+        String text = " " + "x".repeat(1599);
+        List<String> parts = ShoutComposer.split(text);
+        assertEquals(16, parts.size());
+        assertEquals(text, String.join("", parts));
+    }
 }

@@ -31,7 +31,7 @@ public final class ShoutComposer {
             for (int i = offset; i < hardEnd; i++) {
                 if (Character.isWhitespace(completeText.charAt(i))) boundary = i;
             }
-            int end = boundary >= offset ? boundary + 1 : hardEnd;
+            int end = boundary > offset ? boundary + 1 : hardEnd;
             if (end <= offset) end = hardEnd;
             parts.add(completeText.substring(offset, end));
             offset = end;

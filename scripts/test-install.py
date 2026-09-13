@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -103,6 +104,42 @@ def main() -> None:
         assert (recover.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
         assert not recover.pending_upgrade.exists()
 
+        relative_root = root / "relative"
+        relative = make_layout(relative_root)
+        relative_layout = Layout(
+            Path(os.path.relpath(relative.profile)),
+            Path(os.path.relpath(relative.shared_extensions)),
+            Path(os.path.relpath(relative.shared_app)),
+        )
+        install(relative_layout, first)
+        assert (relative.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+        assert (relative.profile_extensions / "SharedOne").resolve() == (
+            relative.shared_extensions / "SharedOne"
+        ).resolve()
+
+        rollback_root = root / "rollback-recovery"
+        rollback_layout = make_layout(rollback_root)
+        install(rollback_layout, first)
+        install(rollback_layout, second)
+        rollback_target = next(
+            path for path in rollback_layout.backup_root.iterdir() if path.is_dir()
+        )
+        interrupted_current = rollback_layout.backup_root / "interrupted-current"
+        os.replace(rollback_layout.plugin, interrupted_current)
+        rollback_layout.pending_rollback.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "rollback",
+                    "target": rollback_target.name,
+                    "current": interrupted_current.name,
+                }
+            ),
+            encoding="utf-8",
+        )
+        rollback(rollback_layout)
+        assert (rollback_layout.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+
         unknown_root = root / "unknown"
         unknown = make_layout(unknown_root)
         unknown.profile.mkdir(parents=True)
@@ -116,6 +153,36 @@ def main() -> None:
             raise AssertionError("installer accepted an unrecognized Steam extension entry")
         assert (unknown.profile_extensions / "Unmanaged").is_dir()
         assert not unknown.plugin.exists()
+
+        duplicate = root / "duplicate.zip"
+        with zipfile.ZipFile(duplicate, "w") as archive:
+            archive.writestr(PLUGIN_DIR + "/command.txt", json.dumps(COMMAND))
+            archive.writestr(PLUGIN_DIR + "/./command.txt", json.dumps(COMMAND))
+            archive.writestr(PLUGIN_DIR + "/extension/G-Earth-Facts.jar", b"jar")
+            archive.writestr(PLUGIN_DIR + "/README.md", "synthetic package")
+            archive.writestr(PLUGIN_DIR + "/LICENSE", "MIT")
+            archive.writestr(PLUGIN_DIR + "/THIRD-PARTY-NOTICES.md", "notices")
+        try:
+            validate_package(duplicate)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted normalized duplicate ZIP members")
+
+        bad_command = root / "bad-command.zip"
+        with zipfile.ZipFile(bad_command, "w") as archive:
+            broken = COMMAND[:-2]
+            archive.writestr(PLUGIN_DIR + "/command.txt", json.dumps(broken))
+            archive.writestr(PLUGIN_DIR + "/extension/G-Earth-Facts.jar", b"jar")
+            archive.writestr(PLUGIN_DIR + "/README.md", "synthetic package")
+            archive.writestr(PLUGIN_DIR + "/LICENSE", "MIT")
+            archive.writestr(PLUGIN_DIR + "/THIRD-PARTY-NOTICES.md", "notices")
+        try:
+            validate_package(bad_command)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a command without host placeholders")
 
         collision_root = root / "collision"
         collision = make_layout(collision_root)

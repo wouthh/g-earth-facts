@@ -1,5 +1,8 @@
 package io.github.wouthh.gearthfacts.runtime;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -38,8 +41,8 @@ public final class ApiNinjasFactClient implements FactClient {
                         .header("Accept", "application/json")
                         .GET()
                         .build();
-        CompletableFuture<HttpResponse<byte[]>> source =
-                client.sendAsync(request, HttpResponse.BodyHandlers.ofByteArray());
+        CompletableFuture<HttpResponse<InputStream>> source =
+                client.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream());
         CompletableFuture<String> result =
                 new CompletableFuture<>() {
                     @Override
@@ -56,19 +59,39 @@ public final class ApiNinjasFactClient implements FactClient {
                         return;
                     }
                     try {
-                        byte[] body = response.body();
-                        if (body == null || body.length > MAX_RESPONSE_BYTES)
-                            throw new FactFailure(
-                                    FactFailure.Kind.INVALID, "API response is too large");
+                        byte[] body = readBounded(response.body());
                         result.complete(
                                 parseResponse(
                                         response.statusCode(),
                                         new String(body, java.nio.charset.StandardCharsets.UTF_8)));
                     } catch (RuntimeException e) {
                         result.completeExceptionally(e);
+                    } catch (IOException e) {
+                        result.completeExceptionally(
+                                new FactFailure(
+                                        FactFailure.Kind.TRANSIENT,
+                                        "Could not read API Ninjas response",
+                                        e));
                     }
                 });
         return result;
+    }
+
+    private static byte[] readBounded(InputStream input) throws IOException {
+        if (input == null) throw new FactFailure(FactFailure.Kind.INVALID, "API response is empty");
+        try (InputStream body = input) {
+            ByteArrayOutputStream output = new ByteArrayOutputStream(MAX_RESPONSE_BYTES);
+            byte[] buffer = new byte[8_192];
+            long total = 0;
+            int read;
+            while ((read = body.read(buffer)) != -1) {
+                total += read;
+                if (total > MAX_RESPONSE_BYTES)
+                    throw new FactFailure(FactFailure.Kind.INVALID, "API response is too large");
+                output.write(buffer, 0, read);
+            }
+            return output.toByteArray();
+        }
     }
 
     public static String parseResponse(int status, String body) {

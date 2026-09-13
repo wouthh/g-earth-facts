@@ -58,6 +58,10 @@ class Layout:
     def pending_upgrade(self) -> Path:
         return self.profile.parent / f".{PLUGIN_DIR}.upgrade.json"
 
+    @property
+    def pending_rollback(self) -> Path:
+        return self.profile.parent / f".{PLUGIN_DIR}.rollback.json"
+
 
 def default_layout() -> Layout:
     home = Path.home()
@@ -119,43 +123,47 @@ def validate_package(zip_path: Path) -> dict[str, object]:
     """Validate the folder-extension shape and command without extracting it."""
     if not zip_path.is_file():
         raise InstallError(f"Extension ZIP is missing: {zip_path}")
-    names: set[str] = set()
+    names: set[tuple[str, ...]] = set()
     total = 0
     try:
         with zipfile.ZipFile(zip_path) as archive:
             for info in archive.infolist():
-                name, _ = _safe_member(info)
-                if name in names:
+                name, parts = _safe_member(info)
+                if parts in names:
                     raise InstallError(f"Duplicate ZIP member: {name}")
-                names.add(name)
+                names.add(parts)
                 total += max(0, info.file_size)
                 if total > MAX_PACKAGE_BYTES:
                     raise InstallError("Extension ZIP is too large")
             required = {
-                f"{PLUGIN_DIR}/command.txt",
-                f"{PLUGIN_DIR}/extension/G-Earth-Facts.jar",
-                f"{PLUGIN_DIR}/README.md",
-                f"{PLUGIN_DIR}/LICENSE",
-                f"{PLUGIN_DIR}/THIRD-PARTY-NOTICES.md",
+                tuple(PurePosixPath(path).parts)
+                for path in (
+                    f"{PLUGIN_DIR}/command.txt",
+                    f"{PLUGIN_DIR}/extension/G-Earth-Facts.jar",
+                    f"{PLUGIN_DIR}/README.md",
+                    f"{PLUGIN_DIR}/LICENSE",
+                    f"{PLUGIN_DIR}/THIRD-PARTY-NOTICES.md",
+                )
             }
             missing = required - names
             if missing:
-                raise InstallError("Extension ZIP is missing: " + ", ".join(sorted(missing)))
+                missing_text = ", ".join("/".join(parts) for parts in sorted(missing))
+                raise InstallError("Extension ZIP is missing: " + missing_text)
             command = json.loads(archive.read(f"{PLUGIN_DIR}/command.txt").decode("utf-8"))
     except (KeyError, OSError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise InstallError("Extension ZIP is not a valid folder package") from exc
-    valid_command = (
-        isinstance(command, list)
-        and bool(command)
-        and all(isinstance(value, str) for value in command)
-        and command[0] == r"C:\G-Earth\jre\bin\java.exe"
-        and r"-Dgearthfacts.stateDir=C:\G-Earth\steam-profile\AppData\Local\G-Earth Facts"
-        in command
-    )
-    if valid_command:
-        jar_index = command.index("-jar") if "-jar" in command else -1
-        valid_command = jar_index >= 0 and jar_index + 1 < len(command)
-        valid_command = valid_command and command[jar_index + 1] == "G-Earth-Facts.jar"
+    valid_command = command == [
+        r"C:\G-Earth\jre\bin\java.exe",
+        r"-Dgearthfacts.stateDir=C:\G-Earth\steam-profile\AppData\Local\G-Earth Facts",
+        "-jar",
+        "G-Earth-Facts.jar",
+        "-p",
+        "{port}",
+        "-f",
+        "{filename}",
+        "-c",
+        "{cookie}",
+    ]
     if not valid_command:
         raise InstallError("Extension command.txt does not select the Steam Java 21 profile")
     return {"members": len(names), "bytes": total, "command": command}
@@ -184,6 +192,24 @@ def _known_plugin(path: Path) -> bool:
         and (path / "command.txt").is_file()
         and (path / "extension" / "G-Earth-Facts.jar").is_file()
     )
+
+
+def _remove_owned_plugin(path: Path) -> None:
+    if not _lexists(path):
+        return
+    if path.is_symlink() or not path.is_dir():
+        raise InstallError(f"Steam plugin path is not an owned directory: {path}")
+    shutil.rmtree(path)
+
+
+def _restore_plugin_backup(layout: Layout, backup: Path) -> None:
+    if not _known_plugin(backup):
+        raise InstallError(f"Steam plugin backup is unavailable: {backup}")
+    _remove_owned_plugin(layout.plugin)
+    restore = layout.profile_extensions / f".{PLUGIN_DIR}.restore"
+    _remove_owned_plugin(restore)
+    shutil.copytree(backup, restore, symlinks=True)
+    os.replace(restore, layout.plugin)
 
 
 def _read_pending_upgrade(layout: Layout) -> Path | None:
@@ -217,15 +243,73 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
 
     if not layout.profile_extensions.is_dir() or layout.profile_extensions.is_symlink():
         raise InstallError(f"Steam Extensions directory is unavailable: {layout.profile_extensions}")
-    restore = layout.profile_extensions / f".{PLUGIN_DIR}.restore"
-    if _lexists(restore):
-        if restore.is_symlink() or not restore.is_dir():
-            raise InstallError(f"Steam restore staging path is unsafe: {restore}")
-        shutil.rmtree(restore)
-    shutil.copytree(backup, restore, symlinks=True)
-    os.replace(restore, layout.plugin)
+    _restore_plugin_backup(layout, backup)
     pending.unlink()
     return backup
+
+
+def _read_pending_rollback(layout: Layout) -> dict[str, str | None] | None:
+    """Finish an interrupted rollback before selecting another backup."""
+    pending = layout.pending_rollback
+    if not _lexists(pending):
+        return None
+    if pending.is_symlink() or not pending.is_file():
+        raise InstallError(f"Pending rollback marker is not a regular file: {pending}")
+    try:
+        state = json.loads(pending.read_text(encoding="utf-8"))
+        if state.get("schema") != 1 or state.get("operation") != "rollback":
+            raise ValueError
+        target_name = state["target"]
+        current_name = state.get("current")
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        AttributeError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        raise InstallError(f"Pending rollback marker is invalid: {pending}")
+
+    def backup_path(name: object, label: str) -> Path | None:
+        if name is None:
+            return None
+        if (
+            not isinstance(name, str)
+            or not name
+            or Path(name).name != name
+            or Path(name).is_absolute()
+        ):
+            raise InstallError(f"Pending rollback marker has an unsafe {label}: {pending}")
+        return layout.backup_root / name
+
+    target = backup_path(target_name, "target")
+    current = backup_path(current_name, "current")
+    if target is None:
+        raise InstallError(f"Pending rollback marker has no target: {pending}")
+    if _lexists(layout.plugin):
+        if not _known_plugin(layout.plugin):
+            raise InstallError(f"Steam plugin is unfamiliar while recovering: {layout.plugin}")
+        completed = not _known_plugin(target) and current is not None and _known_plugin(current)
+        pending.unlink()
+        if completed:
+            return {
+                "target": target.name,
+                "current": current.name if current is not None else None,
+            }
+        return None
+    if not layout.profile_extensions.is_dir() or layout.profile_extensions.is_symlink():
+        raise InstallError(f"Steam Extensions directory is unavailable: {layout.profile_extensions}")
+    source = target if _known_plugin(target) else current
+    if source is None or not _known_plugin(source):
+        raise InstallError(f"Pending rollback backups are unavailable: {pending}")
+    os.replace(source, layout.plugin)
+    pending.unlink()
+    return {
+        "target": target.name,
+        "current": current.name if current is not None else None,
+    }
 
 
 def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Path | None]:
@@ -294,9 +378,19 @@ def _backup_name(root: Path) -> Path:
     return root / f"{PLUGIN_DIR}-{stamp}"
 
 
+def _absolute_layout(layout: Layout) -> Layout:
+    return Layout(
+        layout.profile.expanduser().resolve(),
+        layout.shared_extensions.expanduser().resolve(),
+        layout.shared_app.expanduser().resolve(),
+    )
+
+
 def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     """Install one package, preserving existing entries and an upgrade backup."""
+    layout = _absolute_layout(layout)
     validate_package(zip_path)
+    _read_pending_rollback(layout)
     _read_pending_upgrade(layout)
     shared_children, cert_links, old_plugin = _preflight(layout)
     layout.profile.mkdir(parents=True, exist_ok=True)
@@ -344,16 +438,16 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
         for path in [*created_links, *created_certs]:
             if _lexists(path):
                 path.unlink()
-        if plugin_replaced and _lexists(layout.plugin):
-            shutil.rmtree(layout.plugin)
-        if pending_written and backup is not None and not _lexists(layout.plugin):
-            restore = layout.profile_extensions / f".{PLUGIN_DIR}.restore"
-            shutil.copytree(backup, restore, symlinks=True)
-            os.replace(restore, layout.plugin)
-        if pending_written:
+        if pending_written and backup is not None:
+            try:
+                _restore_plugin_backup(layout, backup)
+            except Exception as recovery:
+                raise InstallError(
+                    "Steam installation failed; pending recovery marker was retained"
+                ) from recovery
             layout.pending_upgrade.unlink(missing_ok=True)
-        if backup is not None and _lexists(backup) and not _lexists(layout.plugin):
-            shutil.move(backup, layout.plugin)
+        elif plugin_replaced and _lexists(layout.plugin):
+            _remove_owned_plugin(layout.plugin)
         if previous_receipt is None:
             layout.receipt.unlink(missing_ok=True)
         else:
@@ -373,6 +467,14 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
 
 def rollback(layout: Layout) -> dict[str, object]:
     """Restore the newest retained plugin backup without touching shared links."""
+    layout = _absolute_layout(layout)
+    recovered = _read_pending_rollback(layout)
+    if recovered is not None:
+        _atomic_json(
+            layout.receipt,
+            {"schema": 1, "plugin": PLUGIN_DIR, "rollback": recovered["target"]},
+        )
+        return {"restored": str(layout.plugin), "previous": recovered["current"]}
     _read_pending_upgrade(layout)
     _require_directory(layout.profile_extensions, "Steam Extensions directory")
     if _lexists(layout.plugin) and not _known_plugin(layout.plugin):
@@ -386,14 +488,38 @@ def rollback(layout: Layout) -> dict[str, object]:
     if not backups:
         raise InstallError("No retained G-Earth Facts backup is available")
     current: Path | None = None
-    if _lexists(layout.plugin):
-        current = _backup_name(layout.backup_root)
-        shutil.move(layout.plugin, current)
-    shutil.move(backups[-1], layout.plugin)
-    _atomic_json(
-        layout.receipt,
-        {"schema": 1, "plugin": PLUGIN_DIR, "rollback": backups[-1].name},
-    )
+    pending_written = False
+    target = backups[-1]
+    try:
+        if _lexists(layout.plugin):
+            current = _backup_name(layout.backup_root)
+            _atomic_json(
+                layout.pending_rollback,
+                {
+                    "schema": 1,
+                    "operation": "rollback",
+                    "target": target.name,
+                    "current": current.name,
+                },
+            )
+            pending_written = True
+            os.replace(layout.plugin, current)
+        os.replace(target, layout.plugin)
+        _atomic_json(
+            layout.receipt,
+            {"schema": 1, "plugin": PLUGIN_DIR, "rollback": target.name},
+        )
+        if pending_written:
+            layout.pending_rollback.unlink(missing_ok=True)
+    except Exception as exc:
+        if pending_written and not _lexists(layout.plugin):
+            source = target if _known_plugin(target) else current
+            if source is not None and _known_plugin(source):
+                os.replace(source, layout.plugin)
+                layout.pending_rollback.unlink(missing_ok=True)
+        if isinstance(exc, InstallError):
+            raise
+        raise InstallError("Rollback interrupted; recovery state was retained") from exc
     return {"restored": str(layout.plugin), "previous": str(current) if current else None}
 
 

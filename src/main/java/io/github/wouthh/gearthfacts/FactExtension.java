@@ -61,6 +61,8 @@ public final class FactExtension extends Extension implements AutoCloseable {
                 (host, port, version, identifier, client) -> {
                     // A reconnect is a new publishing generation.  Requiring a fresh Start
                     // avoids carrying a request or countdown across connection boundaries.
+                    origins = false;
+                    roomId = 0;
                     scheduler.disconnect();
                     origins = OriginsProtocol.isOrigins(host, client);
                     roomId = 0;

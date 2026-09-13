@@ -6,6 +6,7 @@ import com.sun.net.httpserver.HttpServer;
 import io.github.wouthh.gearthfacts.runtime.ApiNinjasFactClient;
 import io.github.wouthh.gearthfacts.runtime.FactFailure;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.Authenticator;
 import java.net.CookieHandler;
 import java.net.InetSocketAddress;
@@ -83,7 +84,8 @@ class FactClientTest {
 
     private static final class PendingHttpClient extends HttpClient {
         private final HttpClient delegate = HttpClient.newHttpClient();
-        private final CompletableFuture<HttpResponse<byte[]>> source = new CompletableFuture<>();
+        private final CompletableFuture<HttpResponse<InputStream>> source =
+                new CompletableFuture<>();
 
         @Override
         public Optional<CookieHandler> cookieHandler() {

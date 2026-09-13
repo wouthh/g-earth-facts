@@ -33,4 +33,13 @@ class SettingsStoreTest {
             assertThrows(IOException.class, () -> new SettingsStore(directory));
         }
     }
+
+    @Test
+    void rejectsSerializedSettingsThatWouldExceedTheProfileLimit() throws Exception {
+        Path directory = Files.createTempDirectory("facts-size-");
+        try (SettingsStore store = new SettingsStore(directory)) {
+            assertThrows(IOException.class, () -> store.save(new Settings("", "\\".repeat(8192))));
+            assertFalse(Files.exists(directory.resolve("settings.properties")));
+        }
+    }
 }
