@@ -55,7 +55,9 @@ public final class ApiNinjasFactClient implements FactClient {
                         return cancelled;
                     }
                 };
-        source.whenComplete(
+        // InputStream bodies become available after headers; parse them off the HTTP
+        // implementation thread so a slow body cannot block the client's dispatcher.
+        source.whenCompleteAsync(
                 (response, error) -> {
                     if (error != null) {
                         result.completeExceptionally(classify(error));

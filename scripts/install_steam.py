@@ -154,7 +154,8 @@ def validate_package(zip_path: Path) -> dict[str, object]:
             for parts in required:
                 info = members[parts]
                 mode = (info.external_attr >> 16) & 0xFFFF
-                if info.is_dir() or (mode and stat.S_ISDIR(mode)):
+                file_type = stat.S_IFMT(mode)
+                if info.is_dir() or (file_type and file_type != stat.S_IFREG):
                     raise InstallError(
                         f"Extension ZIP member is not a regular file: {info.filename}"
                     )
