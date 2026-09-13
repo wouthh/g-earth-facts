@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import secrets
 import shutil
 import stat
 import tempfile
@@ -28,6 +29,7 @@ PLUGIN_DIR = f"{PLUGIN_ID}-{VERSION}"
 ZIP_NAME = f"G-Earth-Facts-{VERSION}-extension.zip"
 MAX_PACKAGE_BYTES = 64 * 1024 * 1024
 CERT_NAMES = ("gearth-nitro-v2.crt", "gearth-nitro-v2.key")
+FIRST_INSTALL_TOKEN = ".g-earth-facts-install-token"
 BACKUP_NAME_PATTERN = re.compile(
     rf"^{re.escape(PLUGIN_ID)}-\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?-(?P<timestamp>\d{{8}}T\d{{6}}\.\d{{6}}Z)$"
 )
@@ -250,11 +252,16 @@ def _extract_package(zip_path: Path, destination: Path) -> Path:
 
 
 def _known_plugin(path: Path) -> bool:
+    command = path / "command.txt"
+    jar = path / "extension" / "G-Earth-Facts.jar"
     return (
         path.is_dir()
         and not path.is_symlink()
-        and (path / "command.txt").is_file()
-        and (path / "extension" / "G-Earth-Facts.jar").is_file()
+        and command.is_file()
+        and not command.is_symlink()
+        and jar.is_file()
+        and not jar.is_symlink()
+        and jar.stat().st_size > 0
     )
 
 
@@ -307,10 +314,25 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
     operation = state.get("operation", "upgrade")
     if operation == "first-install":
         plugin_name = state.get("plugin")
-        if not _valid_plugin_name(plugin_name) or plugin_name != layout.plugin.name:
+        token = state.get("token")
+        if (
+            not _valid_plugin_name(plugin_name)
+            or plugin_name != layout.plugin.name
+            or not isinstance(token, str)
+            or re.fullmatch(r"[0-9a-f]{32}", token) is None
+        ):
             raise InstallError(f"Pending upgrade marker is invalid: {pending}")
         if _lexists(layout.plugin):
             if layout.plugin.is_symlink() or not layout.plugin.is_dir():
+                raise InstallError(f"Steam plugin is unfamiliar while recovering: {layout.plugin}")
+            token_path = layout.plugin / FIRST_INSTALL_TOKEN
+            if token_path.is_symlink() or not token_path.is_file():
+                raise InstallError(f"Steam plugin is unfamiliar while recovering: {layout.plugin}")
+            try:
+                installed_token = token_path.read_text(encoding="ascii")
+            except (OSError, UnicodeDecodeError):
+                raise InstallError(f"Steam plugin is unfamiliar while recovering: {layout.plugin}")
+            if installed_token != token + "\n":
                 raise InstallError(f"Steam plugin is unfamiliar while recovering: {layout.plugin}")
             if _read_receipt_plugin_name(layout.profile) == plugin_name:
                 if not _known_plugin(layout.plugin):
@@ -572,9 +594,16 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     try:
         stage_root = _extract_package(zip_path, stage_parent)
         if first_install_marker:
+            token = secrets.token_hex(16)
+            (stage_root / FIRST_INSTALL_TOKEN).write_text(token + "\n", encoding="ascii")
             _atomic_json(
                 layout.pending_upgrade,
-                {"schema": 1, "operation": "first-install", "plugin": layout.plugin.name},
+                {
+                    "schema": 1,
+                    "operation": "first-install",
+                    "plugin": layout.plugin.name,
+                    "token": token,
+                },
             )
             pending_written = True
         if old_plugin is not None:
@@ -663,6 +692,7 @@ def rollback(layout: Layout) -> dict[str, object]:
     _ensure_profile_isolated(layout)
     _ensure_backup_root_safe(layout)
     _ensure_receipt_safe(layout)
+    _read_pending_upgrade(layout)
     _require_receipt_for_existing_plugin(layout)
     recovered = _read_pending_rollback(layout)
     if recovered is not None:
@@ -671,7 +701,6 @@ def rollback(layout: Layout) -> dict[str, object]:
             {"schema": 1, "plugin": layout.plugin.name, "rollback": recovered["target"]},
         )
         return {"restored": str(layout.plugin), "previous": recovered["current"]}
-    _read_pending_upgrade(layout)
     _require_directory(layout.profile_extensions, "Steam Extensions directory")
     if _lexists(layout.plugin) and not _known_plugin(layout.plugin):
         raise InstallError(f"Current Steam plugin is missing or unfamiliar: {layout.plugin}")

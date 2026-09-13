@@ -12,7 +12,15 @@ import tempfile
 from unittest.mock import patch
 import zipfile
 
-from install_steam import InstallError, Layout, PLUGIN_DIR, install, rollback, validate_package
+from install_steam import (
+    FIRST_INSTALL_TOKEN,
+    InstallError,
+    Layout,
+    PLUGIN_DIR,
+    install,
+    rollback,
+    validate_package,
+)
 
 
 COMMAND = [
@@ -138,15 +146,81 @@ def main() -> None:
         partial_first = first_recovery.profile_extensions / PLUGIN_DIR
         partial_first.mkdir()
         (partial_first / "partial.txt").write_text("incomplete", encoding="utf-8")
+        first_token = "a" * 32
+        (partial_first / FIRST_INSTALL_TOKEN).write_text(
+            first_token + "\n", encoding="ascii"
+        )
         first_recovery.pending_upgrade.write_text(
             json.dumps(
-                {"schema": 1, "operation": "first-install", "plugin": PLUGIN_DIR}
+                {
+                    "schema": 1,
+                    "operation": "first-install",
+                    "plugin": PLUGIN_DIR,
+                    "token": first_token,
+                }
             ),
             encoding="utf-8",
         )
         install(first_recovery, second)
         assert (first_recovery.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
         assert not first_recovery.pending_upgrade.exists()
+
+        unrelated_first_root = root / "unrelated-first-install"
+        unrelated_first = make_layout(unrelated_first_root)
+        unrelated_first.profile.mkdir(parents=True)
+        unrelated_first.profile_extensions.mkdir()
+        unrelated_destination = unrelated_first.profile_extensions / PLUGIN_DIR
+        unrelated_destination.mkdir()
+        (unrelated_destination / "keep.txt").write_text("preserve", encoding="utf-8")
+        unrelated_token = "b" * 32
+        unrelated_first.pending_upgrade.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "first-install",
+                    "plugin": PLUGIN_DIR,
+                    "token": unrelated_token,
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            install(unrelated_first, second)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("first-install recovery deleted an unrelated directory")
+        assert (unrelated_destination / "keep.txt").read_text(encoding="utf-8") == "preserve"
+        assert unrelated_first.pending_upgrade.exists()
+
+        first_rollback_recovery_root = root / "first-rollback-recovery"
+        first_rollback_recovery = make_layout(first_rollback_recovery_root)
+        first_rollback_recovery.profile.mkdir(parents=True)
+        first_rollback_recovery.profile_extensions.mkdir()
+        first_rollback_plugin = first_rollback_recovery.profile_extensions / PLUGIN_DIR
+        first_rollback_plugin.mkdir()
+        (first_rollback_plugin / FIRST_INSTALL_TOKEN).write_text(
+            "c" * 32 + "\n", encoding="ascii"
+        )
+        first_rollback_recovery.pending_upgrade.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "first-install",
+                    "plugin": PLUGIN_DIR,
+                    "token": "c" * 32,
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            rollback(first_rollback_recovery)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback accepted an incomplete first-install recovery")
+        assert not first_rollback_plugin.exists()
+        assert not first_rollback_recovery.pending_upgrade.exists()
 
         restore_collision_root = root / "restore-collision"
         restore_collision = make_layout(restore_collision_root)
@@ -378,6 +452,40 @@ def main() -> None:
                 raise AssertionError("installer overwrote a colliding backup path")
         assert (occupied_backup / "keep.txt").read_text(encoding="utf-8") == "preserve"
         assert (backup_name_collision.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+
+        symlink_plugin_root = root / "symlink-plugin"
+        symlink_plugin = make_layout(symlink_plugin_root)
+        install(symlink_plugin, first)
+        external_command = symlink_plugin_root / "external-command.txt"
+        external_command.write_text("external", encoding="utf-8")
+        (symlink_plugin.plugin / "command.txt").unlink()
+        (symlink_plugin.plugin / "command.txt").symlink_to(external_command)
+        try:
+            install(symlink_plugin, second)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a symlinked managed command")
+        assert (symlink_plugin.plugin / "command.txt").is_symlink()
+        assert (symlink_plugin.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+
+        symlink_backup_root = root / "symlink-backup"
+        symlink_backup = make_layout(symlink_backup_root)
+        install(symlink_backup, first)
+        install(symlink_backup, second)
+        symlink_backup_target = next(path for path in symlink_backup.backup_root.iterdir() if path.is_dir())
+        external_jar = symlink_backup_root / "external.jar"
+        external_jar.write_bytes(b"external")
+        managed_jar = symlink_backup_target / "extension" / "G-Earth-Facts.jar"
+        managed_jar.unlink()
+        managed_jar.symlink_to(external_jar)
+        try:
+            rollback(symlink_backup)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback accepted a symlinked retained JAR")
+        assert (symlink_backup.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
 
         missing_receipt_root = root / "missing-receipt"
         missing_receipt = make_layout(missing_receipt_root)
