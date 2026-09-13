@@ -386,10 +386,19 @@ def _absolute_layout(layout: Layout) -> Layout:
     )
 
 
+def _paths_overlap(first: Path, second: Path) -> bool:
+    """Return whether either path is the other path or one of its children."""
+    return first == second or first.is_relative_to(second) or second.is_relative_to(first)
+
+
 def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     """Install one package, preserving existing entries and an upgrade backup."""
     layout = _absolute_layout(layout)
     validate_package(zip_path)
+    if _paths_overlap(layout.profile, layout.shared_app):
+        raise InstallError("Steam profile overlaps the shared G-Earth directory")
+    if _paths_overlap(layout.profile, layout.shared_extensions):
+        raise InstallError("Steam profile overlaps the shared Extensions directory")
     _read_pending_rollback(layout)
     _read_pending_upgrade(layout)
     shared_children, cert_links, old_plugin = _preflight(layout)

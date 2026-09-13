@@ -10,6 +10,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.atomic.AtomicReference;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -43,12 +44,14 @@ public final class ApiNinjasFactClient implements FactClient {
                         .build();
         CompletableFuture<HttpResponse<InputStream>> source =
                 client.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream());
+        AtomicReference<InputStream> responseBody = new AtomicReference<>();
         CompletableFuture<String> result =
                 new CompletableFuture<>() {
                     @Override
                     public boolean cancel(boolean mayInterruptIfRunning) {
                         boolean cancelled = super.cancel(mayInterruptIfRunning);
                         source.cancel(mayInterruptIfRunning);
+                        closeQuietly(responseBody.getAndSet(null));
                         return cancelled;
                     }
                 };
@@ -58,12 +61,19 @@ public final class ApiNinjasFactClient implements FactClient {
                         result.completeExceptionally(classify(error));
                         return;
                     }
+                    InputStream body = response == null ? null : response.body();
+                    responseBody.set(body);
+                    if (result.isCancelled()) {
+                        closeQuietly(responseBody.getAndSet(null));
+                        return;
+                    }
                     try {
-                        byte[] body = readBounded(response.body());
+                        byte[] bytes = readBounded(body);
                         result.complete(
                                 parseResponse(
                                         response.statusCode(),
-                                        new String(body, java.nio.charset.StandardCharsets.UTF_8)));
+                                        new String(
+                                                bytes, java.nio.charset.StandardCharsets.UTF_8)));
                     } catch (RuntimeException e) {
                         result.completeExceptionally(e);
                     } catch (IOException e) {
@@ -72,9 +82,19 @@ public final class ApiNinjasFactClient implements FactClient {
                                         FactFailure.Kind.TRANSIENT,
                                         "Could not read API Ninjas response",
                                         e));
+                    } finally {
+                        responseBody.compareAndSet(body, null);
                     }
                 });
         return result;
+    }
+
+    private static void closeQuietly(InputStream input) {
+        if (input == null) return;
+        try {
+            input.close();
+        } catch (IOException ignored) {
+        }
     }
 
     private static byte[] readBounded(InputStream input) throws IOException {

@@ -40,6 +40,7 @@ class FactSchedulerTest {
                             Duration.ofMillis(80),
                             Duration.ofMillis(10),
                             ignored -> {});
+            scheduler.roomChanged(1);
             scheduler.start("key", "", 1);
             scheduler.start("key", "ignored", 1);
             assertFalse(fetchCalled.await(20, TimeUnit.MILLISECONDS));
@@ -77,6 +78,7 @@ class FactSchedulerTest {
                             Duration.ofMillis(10),
                             Duration.ofMillis(10),
                             ignored -> {});
+            scheduler.roomChanged(1);
             scheduler.start("key", "A", 1);
             assertTrue(requested.await(200, TimeUnit.MILLISECONDS));
             scheduler.setPrefix("B");
@@ -94,6 +96,7 @@ class FactSchedulerTest {
                             Duration.ofMillis(10),
                             Duration.ofMillis(10),
                             ignored -> {});
+            stopped.roomChanged(1);
             stopped.start("key", "", 1);
             auth.completeExceptionally(
                     new FactFailure(FactFailure.Kind.AUTHENTICATION, "rejected"));
@@ -126,6 +129,7 @@ class FactSchedulerTest {
                             Duration.ofMillis(5),
                             Duration.ofMillis(5),
                             ignored -> {});
+            scheduler.roomChanged(1);
             scheduler.start("key", "", 1);
             assertTrue(requested.await(200, TimeUnit.MILLISECONDS));
             scheduler.disconnect();
@@ -133,6 +137,28 @@ class FactSchedulerTest {
             Thread.sleep(40);
             assertFalse(scheduler.isRunning());
             assertTrue(packets.isEmpty());
+            scheduler.close();
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void startRejectsAStaleRoomSnapshotAfterDisconnect() {
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        try {
+            FactScheduler scheduler =
+                    new FactScheduler(
+                            key -> CompletableFuture.completedFuture("fact"),
+                            packet -> true,
+                            executor,
+                            Duration.ofSeconds(1),
+                            Duration.ofMillis(10),
+                            ignored -> {});
+            scheduler.roomChanged(1);
+            scheduler.disconnect();
+            assertFalse(scheduler.start("key", "", 1));
+            assertFalse(scheduler.isRunning());
             scheduler.close();
         } finally {
             executor.shutdownNow();

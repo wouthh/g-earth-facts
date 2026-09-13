@@ -63,21 +63,24 @@ public final class FactScheduler implements AutoCloseable {
         return duration;
     }
 
-    public void start(String apiKey, String prefix, long roomId) {
+    public boolean start(String apiKey, String prefix, long roomId) {
         if (apiKey == null || apiKey.isBlank())
             throw new IllegalArgumentException("An API key is required");
         if (roomId <= 0) throw new IllegalArgumentException("A known room is required");
         synchronized (lock) {
             ensureOpen();
-            if (running) return;
+            if (running) return true;
+            // The caller's room snapshot may be stale by the time it acquires this lock.
+            // Never resurrect a sequence after disconnect/navigation has cleared the room.
+            if (this.roomId != roomId) return false;
             this.apiKey = apiKey.trim();
             this.prefix = prefix == null ? "" : prefix;
-            this.roomId = roomId;
             running = true;
             generation++;
             cancelWorkLocked();
             scheduleTickLocked(generation, interval);
             publishLocked("Armed; first fact in 10 minutes");
+            return true;
         }
     }
 

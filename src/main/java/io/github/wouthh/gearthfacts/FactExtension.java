@@ -180,7 +180,8 @@ public final class FactExtension extends Extension implements AutoCloseable {
             publishStatus("Save an API Ninjas key before starting");
             return;
         }
-        scheduler.start(settings.apiKey(), settings.prefix(), roomId);
+        if (!scheduler.start(settings.apiKey(), settings.prefix(), roomId))
+            publishStatus("Room changed before publishing could start");
     }
 
     private void savePrefix(String prefix) {
@@ -224,8 +225,13 @@ public final class FactExtension extends Extension implements AutoCloseable {
         if (current != null && !closed.get())
             SwingUtilities.invokeLater(
                     () -> {
-                        if (window == current) current.update(value);
+                        if (window == current && isLatestSnapshot(latest, value))
+                            current.update(value);
                     });
+    }
+
+    static boolean isLatestSnapshot(PublisherSnapshot latest, PublisherSnapshot value) {
+        return latest == value;
     }
 
     @Override

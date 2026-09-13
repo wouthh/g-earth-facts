@@ -154,6 +154,21 @@ def main() -> None:
         assert (unknown.profile_extensions / "Unmanaged").is_dir()
         assert not unknown.plugin.exists()
 
+        overlap_root = root / "overlap"
+        overlap = make_layout(overlap_root)
+        overlapping = Layout(
+            overlap.shared_app,
+            overlap.shared_extensions,
+            overlap.shared_app,
+        )
+        try:
+            install(overlapping, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a Steam profile overlapping shared G-Earth")
+        assert not (overlap.shared_app / "Extensions" / PLUGIN_DIR).exists()
+
         duplicate = root / "duplicate.zip"
         with zipfile.ZipFile(duplicate, "w") as archive:
             archive.writestr(PLUGIN_DIR + "/command.txt", json.dumps(COMMAND))
