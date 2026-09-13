@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+from unittest.mock import patch
 import zipfile
 
 from install_steam import InstallError, Layout, PLUGIN_DIR, install, rollback, validate_package
@@ -225,6 +226,23 @@ def main() -> None:
             raise AssertionError("rollback accepted a Steam profile overlapping shared G-Earth")
         assert not (rollback_overlap.shared_app / "Extensions" / PLUGIN_DIR).exists()
 
+        backup_overlap_root = root / "backup-overlap"
+        backup_overlap_profile = backup_overlap_root / "steam" / "G-Earth" / "steam-profile"
+        backup_overlap_app = backup_overlap_profile.parent / ".g-earth-facts-backups"
+        backup_overlap_extensions = backup_overlap_app / "Extensions"
+        backup_overlap_extensions.mkdir(parents=True)
+        (backup_overlap_extensions / "SharedOne").mkdir()
+        backup_overlap = Layout(
+            backup_overlap_profile, backup_overlap_extensions, backup_overlap_app
+        )
+        try:
+            install(backup_overlap, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a backup root overlapping shared G-Earth")
+        assert not backup_overlap.plugin.exists()
+
         backup_link_root = root / "backup-link"
         backup_link = make_layout(backup_link_root)
         install(backup_link, first)
@@ -239,6 +257,25 @@ def main() -> None:
             raise AssertionError("installer accepted a symlinked backup directory")
         assert (backup_link.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
 
+        copy_failure_root = root / "copy-failure"
+        copy_failure = make_layout(copy_failure_root)
+        install(copy_failure, first)
+        real_copytree = shutil.copytree
+
+        def partial_copy(source, destination, *args, **kwargs):
+            real_copytree(source, destination, *args, **kwargs)
+            raise OSError("synthetic copy failure")
+
+        with patch("install_steam.shutil.copytree", side_effect=partial_copy):
+            try:
+                install(copy_failure, second)
+            except InstallError:
+                pass
+            else:
+                raise AssertionError("installer accepted a failed backup copy")
+        assert (copy_failure.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+        assert not list(copy_failure.backup_root.iterdir())
+
         receipt_collision_root = root / "receipt-collision"
         receipt_collision = make_layout(receipt_collision_root)
         install(receipt_collision, first)
@@ -252,6 +289,19 @@ def main() -> None:
         else:
             raise AssertionError("rollback accepted an unfamiliar receipt entry")
         assert (receipt_collision.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
+
+        timestamp_root = root / "timestamp-order"
+        timestamp = make_layout(timestamp_root)
+        install(timestamp, first)
+        install(timestamp, second)
+        older_backup = timestamp.backup_root / "G-Earth-Facts-0.9.0-20990101T010000.000000Z"
+        newer_backup = timestamp.backup_root / "G-Earth-Facts-0.10.0-20990101T020000.000000Z"
+        shutil.copytree(timestamp.plugin, older_backup)
+        shutil.copytree(timestamp.plugin, newer_backup)
+        (older_backup / "extension" / "G-Earth-Facts.jar").write_bytes(b"version 0.9")
+        (newer_backup / "extension" / "G-Earth-Facts.jar").write_bytes(b"version 0.10")
+        rollback(timestamp)
+        assert (timestamp.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version 0.10"
 
         backup_collision_root = root / "backup-collision"
         backup_collision = make_layout(backup_collision_root)

@@ -29,7 +29,7 @@ ZIP_NAME = f"G-Earth-Facts-{VERSION}-extension.zip"
 MAX_PACKAGE_BYTES = 64 * 1024 * 1024
 CERT_NAMES = ("gearth-nitro-v2.crt", "gearth-nitro-v2.key")
 BACKUP_NAME_PATTERN = re.compile(
-    rf"^{re.escape(PLUGIN_ID)}-\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?-\d{{8}}T\d{{6}}\.\d{{6}}Z$"
+    rf"^{re.escape(PLUGIN_ID)}-\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?-(?P<timestamp>\d{{8}}T\d{{6}}\.\d{{6}}Z)$"
 )
 
 
@@ -443,6 +443,13 @@ def _generated_backup(path: Path) -> bool:
     )
 
 
+def _backup_timestamp(path: Path) -> str:
+    match = BACKUP_NAME_PATTERN.fullmatch(path.name)
+    if match is None:
+        raise InstallError(f"Unrecognized Steam backup entry: {path}")
+    return match.group("timestamp")
+
+
 def _absolute_layout(layout: Layout) -> Layout:
     return Layout(
         layout.profile.expanduser().resolve(),
@@ -461,6 +468,10 @@ def _ensure_profile_isolated(layout: Layout) -> None:
         raise InstallError("Steam profile overlaps the shared G-Earth directory")
     if _paths_overlap(layout.profile, layout.shared_extensions):
         raise InstallError("Steam profile overlaps the shared Extensions directory")
+    if _paths_overlap(layout.backup_root, layout.shared_app):
+        raise InstallError("Steam backup directory overlaps the shared G-Earth directory")
+    if _paths_overlap(layout.backup_root, layout.shared_extensions):
+        raise InstallError("Steam backup directory overlaps the shared Extensions directory")
 
 
 def _ensure_backup_root_safe(layout: Layout) -> None:
@@ -534,6 +545,11 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
                     "Steam installation failed; pending recovery marker was retained"
                 ) from recovery
             layout.pending_upgrade.unlink(missing_ok=True)
+        elif backup is not None and _lexists(backup):
+            # A failed copy can leave a partial timestamped backup even though no
+            # transaction marker was published.  Remove that owned destination so
+            # rollback cannot mistake it for a usable retained version.
+            _remove_owned_plugin(backup)
         elif plugin_replaced and _lexists(layout.plugin):
             _remove_owned_plugin(layout.plugin)
         if previous_receipt is None:
@@ -578,7 +594,10 @@ def rollback(layout: Layout) -> dict[str, object]:
     ]
     if unfamiliar:
         raise InstallError(f"Unrecognized Steam backup entry: {unfamiliar[0]}")
-    backups = [path for path in backup_entries if _known_plugin(path)]
+    backups = sorted(
+        (path for path in backup_entries if _generated_backup(path)),
+        key=_backup_timestamp,
+    )
     if not backups:
         raise InstallError("No retained G-Earth Facts backup is available")
     current: Path | None = None

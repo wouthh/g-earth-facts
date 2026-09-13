@@ -221,4 +221,33 @@ class FactSchedulerTest {
             executor.shutdownNow();
         }
     }
+
+    @Test
+    void invalidPrefixEditStopsAnActiveSequence() throws Exception {
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        try {
+            CompletableFuture<String> response = new CompletableFuture<>();
+            CountDownLatch requested = new CountDownLatch(1);
+            FactScheduler scheduler =
+                    new FactScheduler(
+                            key -> {
+                                requested.countDown();
+                                return response;
+                            },
+                            packet -> true,
+                            executor,
+                            Duration.ofMillis(10),
+                            Duration.ofMillis(10),
+                            ignored -> {});
+            scheduler.roomChanged(1);
+            scheduler.start("key", "", 1);
+            assertTrue(requested.await(500, TimeUnit.MILLISECONDS));
+            scheduler.setPrefix("😀");
+            assertFalse(scheduler.isRunning());
+            assertTrue(response.isCancelled());
+            scheduler.close();
+        } finally {
+            executor.shutdownNow();
+        }
+    }
 }

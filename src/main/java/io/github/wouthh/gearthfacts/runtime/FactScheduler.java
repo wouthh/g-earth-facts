@@ -86,8 +86,24 @@ public final class FactScheduler implements AutoCloseable {
     }
 
     public void setPrefix(String prefix) {
+        String value = prefix == null ? "" : prefix;
+        try {
+            ShoutComposer.validatePrefix(value);
+        } catch (IllegalArgumentException error) {
+            synchronized (lock) {
+                if (closed) return;
+                this.prefix = value;
+                if (running) {
+                    running = false;
+                    generation++;
+                    cancelWorkLocked();
+                    publishLocked("Prefix cannot be published: " + error.getMessage());
+                }
+            }
+            return;
+        }
         synchronized (lock) {
-            if (!closed) this.prefix = prefix == null ? "" : prefix;
+            if (!closed) this.prefix = value;
         }
     }
 
