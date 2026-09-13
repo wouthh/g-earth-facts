@@ -250,6 +250,13 @@ public final class FactScheduler implements AutoCloseable {
             running = false;
             cancelWorkLocked();
             publishLocked("API key rejected; publishing stopped");
+        } else if (failure instanceof FactFailure ff && ff.kind() == FactFailure.Kind.PERMANENT) {
+            running = false;
+            cancelWorkLocked();
+            publishLocked(
+                    message == null
+                            ? "Fact request failed permanently; publishing stopped"
+                            : message);
         } else {
             scheduleTickLocked(token, interval);
             publishLocked(

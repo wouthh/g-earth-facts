@@ -187,4 +187,38 @@ class FactSchedulerTest {
             executor.shutdownNow();
         }
     }
+
+    @Test
+    void permanentFactFailureStopsWithoutSchedulingAnotherRequest() throws Exception {
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        try {
+            AtomicInteger requests = new AtomicInteger();
+            CountDownLatch stopped = new CountDownLatch(1);
+            FactScheduler scheduler =
+                    new FactScheduler(
+                            key -> {
+                                requests.incrementAndGet();
+                                return CompletableFuture.failedFuture(
+                                        new FactFailure(
+                                                FactFailure.Kind.PERMANENT, "Invalid endpoint"));
+                            },
+                            packet -> true,
+                            executor,
+                            Duration.ofMillis(10),
+                            Duration.ofMillis(10),
+                            snapshot -> {
+                                if (!snapshot.running()
+                                        && snapshot.status().equals("Invalid endpoint"))
+                                    stopped.countDown();
+                            });
+            scheduler.roomChanged(1);
+            scheduler.start("key", "", 1);
+            assertTrue(stopped.await(500, TimeUnit.MILLISECONDS));
+            assertFalse(scheduler.isRunning());
+            assertEquals(1, requests.get());
+            scheduler.close();
+        } finally {
+            executor.shutdownNow();
+        }
+    }
 }

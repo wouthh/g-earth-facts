@@ -182,6 +182,17 @@ def main() -> None:
         assert (unknown.profile_extensions / "Unmanaged").is_dir()
         assert not unknown.plugin.exists()
 
+        shared_managed_root = root / "shared-managed-name"
+        shared_managed = make_layout(shared_managed_root)
+        (shared_managed.shared_extensions / "G-Earth-Facts-0.0.9").mkdir()
+        try:
+            install(shared_managed, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a managed name in the shared profile")
+        assert not shared_managed.plugin.exists()
+
         overlap_root = root / "overlap"
         overlap = make_layout(overlap_root)
         overlapping = Layout(
@@ -227,6 +238,34 @@ def main() -> None:
         else:
             raise AssertionError("installer accepted a symlinked backup directory")
         assert (backup_link.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+
+        receipt_collision_root = root / "receipt-collision"
+        receipt_collision = make_layout(receipt_collision_root)
+        install(receipt_collision, first)
+        install(receipt_collision, second)
+        receipt_collision.receipt.unlink()
+        receipt_collision.receipt.mkdir()
+        try:
+            rollback(receipt_collision)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback accepted an unfamiliar receipt entry")
+        assert (receipt_collision.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
+
+        backup_collision_root = root / "backup-collision"
+        backup_collision = make_layout(backup_collision_root)
+        install(backup_collision, first)
+        install(backup_collision, second)
+        untrusted_backup = backup_collision.backup_root / "untrusted"
+        shutil.copytree(backup_collision.plugin, untrusted_backup)
+        try:
+            rollback(backup_collision)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback accepted an unfamiliar backup entry")
+        assert (backup_collision.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
 
         duplicate = root / "duplicate.zip"
         with zipfile.ZipFile(duplicate, "w") as archive:

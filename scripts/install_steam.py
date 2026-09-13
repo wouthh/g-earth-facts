@@ -15,6 +15,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import stat
 import tempfile
@@ -27,6 +28,9 @@ PLUGIN_DIR = f"{PLUGIN_ID}-{VERSION}"
 ZIP_NAME = f"G-Earth-Facts-{VERSION}-extension.zip"
 MAX_PACKAGE_BYTES = 64 * 1024 * 1024
 CERT_NAMES = ("gearth-nitro-v2.crt", "gearth-nitro-v2.key")
+BACKUP_NAME_PATTERN = re.compile(
+    rf"^{re.escape(PLUGIN_ID)}-\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?-\d{{8}}T\d{{6}}\.\d{{6}}Z$"
+)
 
 
 class InstallError(RuntimeError):
@@ -115,6 +119,13 @@ def _require_directory(path: Path, label: str, allow_missing: bool = False) -> N
         raise InstallError(f"{label} is missing: {path}")
     if path.is_symlink() or not path.is_dir():
         raise InstallError(f"{label} must be a real directory: {path}")
+
+
+def _ensure_receipt_safe(layout: Layout) -> None:
+    if _lexists(layout.receipt) and (
+        layout.receipt.is_symlink() or not layout.receipt.is_file()
+    ):
+        raise InstallError(f"Steam installation receipt is not a regular file: {layout.receipt}")
 
 
 def _same_target(link: Path, source: Path) -> bool:
@@ -376,8 +387,8 @@ def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Pat
             f"Steam plugin version collision: {layout.profile_extensions / PLUGIN_DIR}"
         )
     for child in shared_children:
-        if child.name == PLUGIN_DIR:
-            raise InstallError(f"The shared profile already owns {PLUGIN_DIR}")
+        if _valid_plugin_name(child.name):
+            raise InstallError(f"The shared profile already owns a managed name: {child.name}")
         if not _lexists(child):
             raise InstallError(f"Shared extension disappeared during preflight: {child}")
         destination = layout.profile_extensions / child.name
@@ -401,10 +412,7 @@ def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Pat
                 raise InstallError(f"Steam certificate-path collision: {destination}")
             if not _lexists(destination):
                 cert_links.append((destination, source))
-    if _lexists(layout.receipt) and (
-        layout.receipt.is_symlink() or not layout.receipt.is_file()
-    ):
-        raise InstallError(f"Steam installation receipt is not a regular file: {layout.receipt}")
+    _ensure_receipt_safe(layout)
     return shared_children, cert_links, old_plugin
 
 
@@ -425,6 +433,14 @@ def _atomic_json(path: Path, value: dict[str, object]) -> None:
 def _backup_name(root: Path) -> Path:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     return root / f"{PLUGIN_DIR}-{stamp}"
+
+
+def _generated_backup(path: Path) -> bool:
+    return (
+        path.is_dir()
+        and not path.is_symlink()
+        and BACKUP_NAME_PATTERN.fullmatch(path.name) is not None
+    )
 
 
 def _absolute_layout(layout: Layout) -> Layout:
@@ -542,6 +558,7 @@ def rollback(layout: Layout) -> dict[str, object]:
     layout = _absolute_layout(layout)
     _ensure_profile_isolated(layout)
     _ensure_backup_root_safe(layout)
+    _ensure_receipt_safe(layout)
     recovered = _read_pending_rollback(layout)
     if recovered is not None:
         _atomic_json(
@@ -555,10 +572,13 @@ def rollback(layout: Layout) -> dict[str, object]:
         raise InstallError(f"Current Steam plugin is missing or unfamiliar: {layout.plugin}")
     if not layout.backup_root.is_dir() or layout.backup_root.is_symlink():
         raise InstallError("No retained G-Earth Facts backup is available")
-    backups = sorted(
-        (path for path in layout.backup_root.iterdir() if _known_plugin(path)),
-        key=lambda path: path.name,
-    )
+    backup_entries = sorted(layout.backup_root.iterdir(), key=lambda path: path.name)
+    unfamiliar = [
+        path for path in backup_entries if not _generated_backup(path) or not _known_plugin(path)
+    ]
+    if unfamiliar:
+        raise InstallError(f"Unrecognized Steam backup entry: {unfamiliar[0]}")
+    backups = [path for path in backup_entries if _known_plugin(path)]
     if not backups:
         raise InstallError("No retained G-Earth Facts backup is available")
     current: Path | None = None
