@@ -164,4 +164,27 @@ class FactSchedulerTest {
             executor.shutdownNow();
         }
     }
+
+    @Test
+    void startRejectsAnUnpublishablePrefixBeforeArming() {
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+        try {
+            FactScheduler scheduler =
+                    new FactScheduler(
+                            key -> CompletableFuture.completedFuture("fact"),
+                            packet -> true,
+                            executor,
+                            Duration.ofSeconds(1),
+                            Duration.ofMillis(10),
+                            ignored -> {});
+            scheduler.roomChanged(1);
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> scheduler.start("key", "x".repeat(ShoutComposer.MAX_TOTAL_BYTES), 1));
+            assertFalse(scheduler.isRunning());
+            scheduler.close();
+        } finally {
+            executor.shutdownNow();
+        }
+    }
 }

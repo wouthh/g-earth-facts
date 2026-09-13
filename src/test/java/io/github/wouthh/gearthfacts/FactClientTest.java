@@ -105,6 +105,33 @@ class FactClientTest {
         assertFalse(completion.isAlive());
     }
 
+    @Test
+    void bodyReadTimeoutClosesAStalledResponse() throws Exception {
+        PendingHttpClient http = new PendingHttpClient();
+        BlockingInputStream body = new BlockingInputStream();
+        var executor = java.util.concurrent.Executors.newCachedThreadPool();
+        try {
+            CompletableFuture<String> result =
+                    new ApiNinjasFactClient(
+                                    http,
+                                    URI.create("http://facts.test/facts"),
+                                    java.time.Duration.ofMillis(50),
+                                    executor)
+                            .fetch("demo-key");
+            http.source.complete(new TestResponse(body));
+            assertTrue(body.started.await(1, TimeUnit.SECONDS));
+            var failure =
+                    assertThrows(
+                            java.util.concurrent.ExecutionException.class,
+                            () -> result.get(1, TimeUnit.SECONDS));
+            assertInstanceOf(FactFailure.class, failure.getCause());
+            assertEquals(FactFailure.Kind.TRANSIENT, ((FactFailure) failure.getCause()).kind());
+            assertTrue(body.closed.await(1, TimeUnit.SECONDS));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
     private static final class BlockingInputStream extends InputStream {
         private final CountDownLatch started = new CountDownLatch(1);
         private final CountDownLatch closed = new CountDownLatch(1);

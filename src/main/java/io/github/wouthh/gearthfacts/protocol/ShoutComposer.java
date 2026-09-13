@@ -10,8 +10,20 @@ import java.util.List;
 public final class ShoutComposer {
     public static final int MAX_CHUNK_BYTES = 100;
     public static final int MAX_PARTS = 16;
+    public static final int MAX_TOTAL_BYTES = MAX_CHUNK_BYTES * MAX_PARTS;
 
     private ShoutComposer() {}
+
+    /** Validate a saved prefix before arming a sequence for a nonempty fact. */
+    public static void validatePrefix(String prefix) {
+        String value = prefix == null ? "" : prefix;
+        CharsetEncoder encoder = StandardCharsets.ISO_8859_1.newEncoder();
+        if (!encoder.canEncode(value))
+            throw new IllegalArgumentException("Prefix must be representable in Latin-1");
+        int bytes = value.getBytes(StandardCharsets.ISO_8859_1).length;
+        if (bytes >= MAX_TOTAL_BYTES)
+            throw new IllegalArgumentException("Prefix leaves no room for a fact");
+    }
 
     public static List<String> split(String completeText) {
         if (completeText == null) throw new IllegalArgumentException("Text is missing");

@@ -5,8 +5,11 @@ Proton prefix. Run `python3 scripts/install_steam.py` from this checkout after
 `python3 scripts/check.py` has produced the ZIP. Its `Extensions` directory is
 a view: existing active extensions are symbolic links to the canonical shared
 Bottles profile, while G-Earth Facts is a regular installed folder from the
-versioned ZIP. The non-Steam launcher continues to use the canonical profile
-and therefore cannot discover the Steam-only folder.
+versioned ZIP. The private receipt records the managed folder name, so a later
+versioned package upgrades the previously installed folder instead of leaving
+an older managed version as an unfamiliar extension. The non-Steam launcher
+continues to use the canonical profile and therefore cannot discover the
+Steam-only folder.
 
 The Steam launcher passes `-Dgearth.data.dir=C:\\G-Earth\\steam-profile` to
 the companion host. This override also scopes G-Earth's certificate files to

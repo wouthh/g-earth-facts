@@ -118,6 +118,20 @@ def main() -> None:
         assert (partial.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
         assert not partial.pending_upgrade.exists()
 
+        legacy_root = root / "legacy-version"
+        legacy = make_layout(legacy_root)
+        install(legacy, first)
+        legacy_name = "G-Earth-Facts-0.0.9"
+        legacy_plugin = legacy.profile_extensions / legacy_name
+        os.replace(legacy.plugin, legacy_plugin)
+        legacy.receipt.write_text(
+            json.dumps({"schema": 1, "plugin": legacy_name}), encoding="utf-8"
+        )
+        install(legacy, second)
+        assert legacy.plugin == legacy_plugin
+        assert (legacy_plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
+        assert not (legacy.profile_extensions / PLUGIN_DIR).exists()
+
         relative_root = root / "relative"
         relative = make_layout(relative_root)
         relative_layout = Layout(

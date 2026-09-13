@@ -22,7 +22,8 @@ import zipfile
 
 
 VERSION = "0.1.0"
-PLUGIN_DIR = f"G-Earth-Facts-{VERSION}"
+PLUGIN_ID = "G-Earth-Facts"
+PLUGIN_DIR = f"{PLUGIN_ID}-{VERSION}"
 ZIP_NAME = f"G-Earth-Facts-{VERSION}-extension.zip"
 MAX_PACKAGE_BYTES = 64 * 1024 * 1024
 CERT_NAMES = ("gearth-nitro-v2.crt", "gearth-nitro-v2.key")
@@ -44,7 +45,7 @@ class Layout:
 
     @property
     def plugin(self) -> Path:
-        return self.profile_extensions / PLUGIN_DIR
+        return self.profile_extensions / _receipt_plugin_name(self.profile)
 
     @property
     def backup_root(self) -> Path:
@@ -56,11 +57,11 @@ class Layout:
 
     @property
     def pending_upgrade(self) -> Path:
-        return self.profile.parent / f".{PLUGIN_DIR}.upgrade.json"
+        return self.profile.parent / f".{PLUGIN_ID}.upgrade.json"
 
     @property
     def pending_rollback(self) -> Path:
-        return self.profile.parent / f".{PLUGIN_DIR}.rollback.json"
+        return self.profile.parent / f".{PLUGIN_ID}.rollback.json"
 
 
 def default_layout() -> Layout:
@@ -83,6 +84,28 @@ def default_layout() -> Layout:
 
 def _lexists(path: Path) -> bool:
     return os.path.lexists(os.fspath(path))
+
+
+def _valid_plugin_name(name: object) -> bool:
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and Path(name).name == name
+        and (name == PLUGIN_ID or name.startswith(f"{PLUGIN_ID}-"))
+    )
+
+
+def _receipt_plugin_name(profile: Path) -> str:
+    """Return the previously managed folder, or this build's default name."""
+    receipt = profile / ".g-earth-facts-install.json"
+    if not _lexists(receipt) or receipt.is_symlink() or not receipt.is_file():
+        return PLUGIN_DIR
+    try:
+        state = json.loads(receipt.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return PLUGIN_DIR
+    name = state.get("plugin") if isinstance(state, dict) else None
+    return name if _valid_plugin_name(name) else PLUGIN_DIR
 
 
 def _require_directory(path: Path, label: str, allow_missing: bool = False) -> None:
@@ -221,7 +244,7 @@ def _restore_plugin_backup(layout: Layout, backup: Path) -> None:
     if not _known_plugin(backup):
         raise InstallError(f"Steam plugin backup is unavailable: {backup}")
     _remove_owned_plugin(layout.plugin)
-    restore = layout.profile_extensions / f".{PLUGIN_DIR}.restore"
+    restore = layout.profile_extensions / f".{PLUGIN_ID}.restore"
     _remove_owned_plugin(restore)
     shutil.copytree(backup, restore, symlinks=True)
     os.replace(restore, layout.plugin)
@@ -342,11 +365,16 @@ def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Pat
     _ensure_backup_root_safe(layout)
 
     shared_children = sorted(layout.shared_extensions.iterdir(), key=lambda path: path.name)
-    expected_names = {PLUGIN_DIR, *(child.name for child in shared_children)}
+    managed_name = layout.plugin.name
+    expected_names = {PLUGIN_DIR, managed_name, *(child.name for child in shared_children)}
     if layout.profile_extensions.is_dir():
         for child in layout.profile_extensions.iterdir():
             if child.name not in expected_names:
                 raise InstallError(f"Unrecognized Steam extension entry: {child}")
+    if managed_name != PLUGIN_DIR and _lexists(layout.profile_extensions / PLUGIN_DIR):
+        raise InstallError(
+            f"Steam plugin version collision: {layout.profile_extensions / PLUGIN_DIR}"
+        )
     for child in shared_children:
         if child.name == PLUGIN_DIR:
             raise InstallError(f"The shared profile already owns {PLUGIN_DIR}")
@@ -471,7 +499,7 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
             layout.receipt,
             {
                 "schema": 1,
-                "plugin": PLUGIN_DIR,
+                "plugin": layout.plugin.name,
                 "managedLinks": [child.name for child in shared_children],
                 "certificates": [destination.name for destination, _ in cert_links],
             },
@@ -518,7 +546,7 @@ def rollback(layout: Layout) -> dict[str, object]:
     if recovered is not None:
         _atomic_json(
             layout.receipt,
-            {"schema": 1, "plugin": PLUGIN_DIR, "rollback": recovered["target"]},
+            {"schema": 1, "plugin": layout.plugin.name, "rollback": recovered["target"]},
         )
         return {"restored": str(layout.plugin), "previous": recovered["current"]}
     _read_pending_upgrade(layout)
@@ -553,7 +581,7 @@ def rollback(layout: Layout) -> dict[str, object]:
         os.replace(target, layout.plugin)
         _atomic_json(
             layout.receipt,
-            {"schema": 1, "plugin": PLUGIN_DIR, "rollback": target.name},
+            {"schema": 1, "plugin": layout.plugin.name, "rollback": target.name},
         )
         if pending_written:
             layout.pending_rollback.unlink(missing_ok=True)

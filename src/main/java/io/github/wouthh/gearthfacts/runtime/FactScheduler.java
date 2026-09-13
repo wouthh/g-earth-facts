@@ -67,6 +67,7 @@ public final class FactScheduler implements AutoCloseable {
         if (apiKey == null || apiKey.isBlank())
             throw new IllegalArgumentException("An API key is required");
         if (roomId <= 0) throw new IllegalArgumentException("A known room is required");
+        ShoutComposer.validatePrefix(prefix);
         synchronized (lock) {
             ensureOpen();
             if (running) return true;

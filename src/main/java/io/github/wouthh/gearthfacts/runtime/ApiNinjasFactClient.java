@@ -8,8 +8,13 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -18,16 +23,32 @@ import org.json.JSONObject;
 public final class ApiNinjasFactClient implements FactClient {
     public static final URI ENDPOINT = URI.create("https://api.api-ninjas.com/v1/facts");
     private static final int MAX_RESPONSE_BYTES = 65_536;
+    private static final Duration DEFAULT_BODY_TIMEOUT = Duration.ofSeconds(20);
     private final HttpClient client;
     private final URI endpoint;
+    private final Duration bodyTimeout;
+    private final Executor bodyExecutor;
 
     public ApiNinjasFactClient() {
         this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), ENDPOINT);
     }
 
     public ApiNinjasFactClient(HttpClient client, URI endpoint) {
-        this.client = java.util.Objects.requireNonNull(client);
-        this.endpoint = java.util.Objects.requireNonNull(endpoint);
+        this(
+                client,
+                endpoint,
+                DEFAULT_BODY_TIMEOUT,
+                client.executor().orElse(ForkJoinPool.commonPool()));
+    }
+
+    public ApiNinjasFactClient(
+            HttpClient client, URI endpoint, Duration bodyTimeout, Executor bodyExecutor) {
+        this.client = Objects.requireNonNull(client);
+        this.endpoint = Objects.requireNonNull(endpoint);
+        if (bodyTimeout == null || bodyTimeout.isNegative() || bodyTimeout.isZero())
+            throw new IllegalArgumentException("bodyTimeout");
+        this.bodyTimeout = bodyTimeout;
+        this.bodyExecutor = Objects.requireNonNull(bodyExecutor);
     }
 
     @Override
@@ -45,12 +66,15 @@ public final class ApiNinjasFactClient implements FactClient {
         CompletableFuture<HttpResponse<InputStream>> source =
                 client.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream());
         AtomicReference<InputStream> responseBody = new AtomicReference<>();
+        AtomicReference<CompletableFuture<byte[]>> bodyRead = new AtomicReference<>();
         CompletableFuture<String> result =
                 new CompletableFuture<>() {
                     @Override
                     public boolean cancel(boolean mayInterruptIfRunning) {
                         boolean cancelled = super.cancel(mayInterruptIfRunning);
                         source.cancel(mayInterruptIfRunning);
+                        CompletableFuture<byte[]> read = bodyRead.getAndSet(null);
+                        if (read != null) read.cancel(mayInterruptIfRunning);
                         closeQuietly(responseBody.getAndSet(null));
                         return cancelled;
                     }
@@ -69,24 +93,50 @@ public final class ApiNinjasFactClient implements FactClient {
                         closeQuietly(responseBody.getAndSet(null));
                         return;
                     }
-                    try {
-                        byte[] bytes = readBounded(body);
-                        result.complete(
-                                parseResponse(
-                                        response.statusCode(),
-                                        new String(
-                                                bytes, java.nio.charset.StandardCharsets.UTF_8)));
-                    } catch (RuntimeException e) {
-                        result.completeExceptionally(e);
-                    } catch (IOException e) {
-                        result.completeExceptionally(
-                                new FactFailure(
-                                        FactFailure.Kind.TRANSIENT,
-                                        "Could not read API Ninjas response",
-                                        e));
-                    } finally {
-                        responseBody.compareAndSet(body, null);
+                    CompletableFuture<byte[]> read =
+                            CompletableFuture.supplyAsync(
+                                            () -> {
+                                                try {
+                                                    return readBounded(body);
+                                                } catch (IOException e) {
+                                                    throw new CompletionException(
+                                                            new FactFailure(
+                                                                    FactFailure.Kind.TRANSIENT,
+                                                                    "Could not read API Ninjas response",
+                                                                    e));
+                                                }
+                                            },
+                                            bodyExecutor)
+                                    .orTimeout(bodyTimeout.toMillis(), TimeUnit.MILLISECONDS);
+                    bodyRead.set(read);
+                    if (result.isCancelled()) {
+                        read.cancel(true);
+                        closeQuietly(responseBody.getAndSet(null));
+                        return;
                     }
+                    read.whenComplete(
+                            (bytes, readError) -> {
+                                bodyRead.compareAndSet(read, null);
+                                if (readError != null) {
+                                    closeQuietly(responseBody.getAndSet(null));
+                                    if (!result.isCancelled())
+                                        result.completeExceptionally(classifyBody(readError));
+                                    return;
+                                }
+                                responseBody.compareAndSet(body, null);
+                                if (result.isCancelled()) return;
+                                try {
+                                    result.complete(
+                                            parseResponse(
+                                                    response.statusCode(),
+                                                    new String(
+                                                            bytes,
+                                                            java.nio.charset.StandardCharsets
+                                                                    .UTF_8)));
+                                } catch (RuntimeException e) {
+                                    result.completeExceptionally(e);
+                                }
+                            });
                 });
         return result;
     }
@@ -114,6 +164,16 @@ public final class ApiNinjasFactClient implements FactClient {
             }
             return output.toByteArray();
         }
+    }
+
+    private static Throwable classifyBody(Throwable error) {
+        Throwable cause = unwrap(error);
+        if (cause instanceof FactFailure) return cause;
+        if (cause instanceof TimeoutException)
+            return new FactFailure(
+                    FactFailure.Kind.TRANSIENT, "API Ninjas response timed out", cause);
+        return new FactFailure(
+                FactFailure.Kind.TRANSIENT, "Could not read API Ninjas response", cause);
     }
 
     public static String parseResponse(int status, String body) {
@@ -149,10 +209,13 @@ public final class ApiNinjasFactClient implements FactClient {
     }
 
     private static FactFailure classify(Throwable error) {
-        Throwable cause =
-                error instanceof CompletionException && error.getCause() != null
-                        ? error.getCause()
-                        : error;
+        Throwable cause = unwrap(error);
         return new FactFailure(FactFailure.Kind.TRANSIENT, "Could not reach API Ninjas", cause);
+    }
+
+    private static Throwable unwrap(Throwable error) {
+        return error instanceof CompletionException && error.getCause() != null
+                ? error.getCause()
+                : error;
     }
 }

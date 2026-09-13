@@ -181,8 +181,12 @@ public final class FactExtension extends Extension implements AutoCloseable {
             publishStatus("Save an API Ninjas key before starting");
             return;
         }
-        if (!scheduler.start(settings.apiKey(), settings.prefix(), roomId))
-            publishStatus("Room changed before publishing could start");
+        try {
+            if (!scheduler.start(settings.apiKey(), settings.prefix(), roomId))
+                publishStatus("Room changed before publishing could start");
+        } catch (IllegalArgumentException e) {
+            publishStatus("Prefix cannot be published: " + e.getMessage());
+        }
     }
 
     private void savePrefix(String prefix) {

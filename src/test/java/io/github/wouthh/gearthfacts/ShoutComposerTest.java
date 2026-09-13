@@ -78,4 +78,15 @@ class ShoutComposerTest {
         assertEquals(16, parts.size());
         assertEquals(text, String.join("", parts));
     }
+
+    @Test
+    void validatesPrefixBudgetBeforeStarting() {
+        assertDoesNotThrow(
+                () -> ShoutComposer.validatePrefix("x".repeat(ShoutComposer.MAX_TOTAL_BYTES - 1)));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> ShoutComposer.validatePrefix("x".repeat(ShoutComposer.MAX_TOTAL_BYTES)));
+        assertThrows(
+                IllegalArgumentException.class, () -> ShoutComposer.validatePrefix("emoji 😀"));
+    }
 }
