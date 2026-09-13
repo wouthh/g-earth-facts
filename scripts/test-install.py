@@ -104,6 +104,20 @@ def main() -> None:
         assert (recover.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
         assert not recover.pending_upgrade.exists()
 
+        partial_root = root / "partial-recover"
+        partial = make_layout(partial_root)
+        install(partial, first)
+        partial.backup_root.mkdir()
+        retained_partial = partial.backup_root / "interrupted-partial"
+        shutil.copytree(partial.plugin, retained_partial)
+        (partial.plugin / "extension" / "G-Earth-Facts.jar").unlink()
+        partial.pending_upgrade.write_text(
+            json.dumps({"schema": 1, "backup": retained_partial.name}), encoding="utf-8"
+        )
+        install(partial, second)
+        assert (partial.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
+        assert not partial.pending_upgrade.exists()
+
         relative_root = root / "relative"
         relative = make_layout(relative_root)
         relative_layout = Layout(

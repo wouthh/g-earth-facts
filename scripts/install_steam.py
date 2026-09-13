@@ -250,11 +250,16 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
     if not _known_plugin(backup):
         raise InstallError(f"Pending upgrade backup is unavailable: {backup}")
     if _lexists(layout.plugin):
-        if not _known_plugin(layout.plugin):
+        if _known_plugin(layout.plugin):
+            # The replacement reached its destination before the marker was cleared.
+            pending.unlink()
+            return backup
+        if layout.plugin.is_symlink() or not layout.plugin.is_dir():
             raise InstallError(f"Steam plugin is unfamiliar while recovering: {layout.plugin}")
-        # The replacement reached its destination before the marker was cleared.
-        pending.unlink()
-        return backup
+        # A killed replacement can leave an incomplete real directory behind.  The
+        # trusted marker identifies this exact managed destination, so remove the
+        # partial directory before restoring the validated backup.
+        _remove_owned_plugin(layout.plugin)
 
     if not layout.profile_extensions.is_dir() or layout.profile_extensions.is_symlink():
         raise InstallError(f"Steam Extensions directory is unavailable: {layout.profile_extensions}")
