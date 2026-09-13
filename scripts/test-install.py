@@ -367,6 +367,25 @@ def main() -> None:
             raise AssertionError("installer accepted a backup root overlapping shared G-Earth")
         assert not backup_overlap.plugin.exists()
 
+        profile_backup_overlap_root = root / "profile-backup-overlap"
+        profile_backup_overlap_profile = profile_backup_overlap_root / ".g-earth-facts-backups"
+        profile_backup_overlap_shared_app = profile_backup_overlap_root / "shared" / "G-Earth"
+        profile_backup_overlap_shared_extensions = profile_backup_overlap_shared_app / "Extensions"
+        profile_backup_overlap_shared_extensions.mkdir(parents=True)
+        (profile_backup_overlap_shared_extensions / "SharedOne").mkdir()
+        profile_backup_overlap = Layout(
+            profile_backup_overlap_profile,
+            profile_backup_overlap_shared_extensions,
+            profile_backup_overlap_shared_app,
+        )
+        try:
+            install(profile_backup_overlap, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a profile overlapping its backup root")
+        assert not (profile_backup_overlap_shared_extensions / PLUGIN_DIR).exists()
+
         profile_symlink_root = root / "profile-symlink"
         profile_symlink = make_layout(profile_symlink_root)
         real_profile = profile_symlink_root / "real-profile"
@@ -417,6 +436,34 @@ def main() -> None:
         else:
             raise AssertionError("installer accepted a directory certificate path")
         assert not directory_certificate.plugin.exists()
+
+        absent_source_directory_root = root / "absent-source-directory-certificate"
+        absent_source_directory = make_layout(absent_source_directory_root)
+        absent_source_directory.profile.mkdir(parents=True)
+        (absent_source_directory.profile / "gearth-nitro-v2.crt").mkdir()
+        try:
+            install(absent_source_directory, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a directory certificate without a shared source")
+        assert (absent_source_directory.profile / "gearth-nitro-v2.crt").is_dir()
+        assert not absent_source_directory.plugin.exists()
+
+        absent_source_symlink_root = root / "absent-source-symlink-certificate"
+        absent_source_symlink = make_layout(absent_source_symlink_root)
+        absent_source_symlink.profile.mkdir(parents=True)
+        (absent_source_symlink.profile / "gearth-nitro-v2.key").symlink_to(
+            absent_source_symlink_root / "missing.key"
+        )
+        try:
+            install(absent_source_symlink, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a symlinked certificate without a shared source")
+        assert (absent_source_symlink.profile / "gearth-nitro-v2.key").is_symlink()
+        assert not absent_source_symlink.plugin.exists()
 
         copy_failure_root = root / "copy-failure"
         copy_failure = make_layout(copy_failure_root)
@@ -618,6 +665,34 @@ def main() -> None:
         else:
             raise AssertionError("installer accepted an unfamiliar link collision")
         assert not collision.plugin.exists()
+
+        stale_link_root = root / "stale-link"
+        stale_link = make_layout(stale_link_root)
+        install(stale_link, first)
+        shutil.rmtree(stale_link.shared_extensions / "SharedOne")
+        install(stale_link, second)
+        assert not (stale_link.profile_extensions / "SharedOne").exists()
+        assert (stale_link.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
+
+        stale_link_collision_root = root / "stale-link-collision"
+        stale_link_collision = make_layout(stale_link_collision_root)
+        install(stale_link_collision, first)
+        shutil.rmtree(stale_link_collision.shared_extensions / "SharedOne")
+        stale_destination = stale_link_collision.profile_extensions / "SharedOne"
+        stale_destination.unlink()
+        stale_destination.symlink_to(
+            stale_link_collision_root / "unrelated", target_is_directory=True
+        )
+        try:
+            install(stale_link_collision, second)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer replaced an unrelated stale extension link")
+        assert stale_destination.is_symlink()
+        assert (
+            stale_link_collision.plugin / "extension/G-Earth-Facts.jar"
+        ).read_bytes() == b"version one"
 
         unsafe = root / "unsafe.zip"
         with zipfile.ZipFile(unsafe, "w") as archive:

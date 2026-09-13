@@ -116,6 +116,42 @@ def _read_receipt_plugin_name(profile: Path) -> str | None:
     return name if _valid_plugin_name(name) else None
 
 
+def _valid_entry_name(name: object) -> bool:
+    return (
+        isinstance(name, str)
+        and bool(name)
+        and name not in {".", ".."}
+        and Path(name).name == name
+        and "/" not in name
+        and "\\" not in name
+    )
+
+
+def _read_receipt_managed_links(profile: Path) -> set[str]:
+    """Read the receipt's prior shared-link names for stale-link recovery."""
+    receipt = profile / ".g-earth-facts-install.json"
+    if not _lexists(receipt) or receipt.is_symlink() or not receipt.is_file():
+        return set()
+    try:
+        state = json.loads(receipt.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return set()
+    if (
+        not isinstance(state, dict)
+        or state.get("schema") != 1
+        or not _valid_plugin_name(state.get("plugin"))
+    ):
+        return set()
+    links = state.get("managedLinks")
+    if links is None:
+        return set()
+    if not isinstance(links, list) or any(
+        not _valid_entry_name(name) or _valid_plugin_name(name) for name in links
+    ):
+        raise InstallError(f"Steam installation receipt has invalid managed links: {receipt}")
+    return set(links)
+
+
 def _receipt_plugin_name(profile: Path) -> str:
     """Return the previously managed folder, or this build's default name."""
     return _read_receipt_plugin_name(profile) or PLUGIN_DIR
@@ -150,6 +186,19 @@ def _same_target(link: Path, source: Path) -> bool:
         return False
     try:
         return link.resolve(strict=True) == source.resolve(strict=True)
+    except OSError:
+        return False
+
+
+def _same_unresolved_target(link: Path, source: Path) -> bool:
+    """Compare symlink paths even when the expected target is currently absent."""
+    if not link.is_symlink():
+        return False
+    try:
+        target = Path(os.readlink(link))
+        if not target.is_absolute():
+            target = link.parent / target
+        return target.resolve(strict=False) == source.resolve(strict=False)
     except OSError:
         return False
 
@@ -454,8 +503,17 @@ def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Pat
     _require_receipt_for_existing_plugin(layout)
 
     shared_children = sorted(layout.shared_extensions.iterdir(), key=lambda path: path.name)
+    shared_names = {child.name for child in shared_children}
+    managed_links = _read_receipt_managed_links(layout.profile)
+    for name in sorted(managed_links - shared_names):
+        destination = layout.profile_extensions / name
+        if not _lexists(destination):
+            continue
+        if not _same_unresolved_target(destination, layout.shared_extensions / name):
+            raise InstallError(f"Steam extension-link collision: {destination}")
+        destination.unlink()
     managed_name = layout.plugin.name
-    expected_names = {PLUGIN_DIR, managed_name, *(child.name for child in shared_children)}
+    expected_names = {PLUGIN_DIR, managed_name, *shared_names, *managed_links}
     if layout.profile_extensions.is_dir():
         for child in layout.profile_extensions.iterdir():
             if child.name not in expected_names:
@@ -490,6 +548,10 @@ def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Pat
                 raise InstallError(f"Steam certificate-path collision: {destination}")
             if not _lexists(destination):
                 cert_links.append((destination, source))
+        elif _lexists(destination) and (destination.is_symlink() or not destination.is_file()):
+            raise InstallError(
+                f"Steam certificate path must be a real file when shared source is absent: {destination}"
+            )
     return shared_children, cert_links, old_plugin
 
 
@@ -554,6 +616,8 @@ def _ensure_profile_isolated(layout: Layout) -> None:
         raise InstallError("Steam profile overlaps the shared G-Earth directory")
     if _paths_overlap(layout.profile, layout.shared_extensions):
         raise InstallError("Steam profile overlaps the shared Extensions directory")
+    if _paths_overlap(layout.profile, layout.backup_root):
+        raise InstallError("Steam profile overlaps its backup directory")
     if _paths_overlap(layout.backup_root, layout.shared_app):
         raise InstallError("Steam backup directory overlaps the shared G-Earth directory")
     if _paths_overlap(layout.backup_root, layout.shared_extensions):
