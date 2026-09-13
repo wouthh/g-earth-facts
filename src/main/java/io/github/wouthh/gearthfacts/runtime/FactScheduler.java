@@ -233,6 +233,7 @@ public final class FactScheduler implements AutoCloseable {
                             TimeUnit.MILLISECONDS);
         } else {
             pendingParts = List.of();
+            part = 0;
             scheduleTickLocked(token, interval);
             publishLocked("Published; next fact in 10 minutes");
         }

@@ -38,18 +38,37 @@ public final class ApiNinjasFactClient implements FactClient {
                         .header("Accept", "application/json")
                         .GET()
                         .build();
-        return client.sendAsync(request, HttpResponse.BodyHandlers.ofByteArray())
-                .handle(
-                        (response, error) -> {
-                            if (error != null) throw new CompletionException(classify(error));
-                            byte[] body = response.body();
-                            if (body == null || body.length > MAX_RESPONSE_BYTES)
-                                throw new FactFailure(
-                                        FactFailure.Kind.INVALID, "API response is too large");
-                            return parseResponse(
-                                    response.statusCode(),
-                                    new String(body, java.nio.charset.StandardCharsets.UTF_8));
-                        });
+        CompletableFuture<HttpResponse<byte[]>> source =
+                client.sendAsync(request, HttpResponse.BodyHandlers.ofByteArray());
+        CompletableFuture<String> result =
+                new CompletableFuture<>() {
+                    @Override
+                    public boolean cancel(boolean mayInterruptIfRunning) {
+                        boolean cancelled = super.cancel(mayInterruptIfRunning);
+                        source.cancel(mayInterruptIfRunning);
+                        return cancelled;
+                    }
+                };
+        source.whenComplete(
+                (response, error) -> {
+                    if (error != null) {
+                        result.completeExceptionally(classify(error));
+                        return;
+                    }
+                    try {
+                        byte[] body = response.body();
+                        if (body == null || body.length > MAX_RESPONSE_BYTES)
+                            throw new FactFailure(
+                                    FactFailure.Kind.INVALID, "API response is too large");
+                        result.complete(
+                                parseResponse(
+                                        response.statusCode(),
+                                        new String(body, java.nio.charset.StandardCharsets.UTF_8)));
+                    } catch (RuntimeException e) {
+                        result.completeExceptionally(e);
+                    }
+                });
+        return result;
     }
 
     public static String parseResponse(int status, String body) {

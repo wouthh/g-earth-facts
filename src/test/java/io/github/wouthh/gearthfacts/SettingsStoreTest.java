@@ -15,10 +15,10 @@ class SettingsStoreTest {
         Path directory = Files.createTempDirectory("facts-settings-");
         SettingsStore store = new SettingsStore(directory);
         assertEquals(new Settings("", ""), store.load());
-        store.save(new Settings("secret", "Did you know?  "));
+        store.save(new Settings("secret", "Did you know? café  "));
         store.close();
         try (SettingsStore reopened = new SettingsStore(directory)) {
-            assertEquals(new Settings("secret", "Did you know?  "), reopened.load());
+            assertEquals(new Settings("secret", "Did you know? café  "), reopened.load());
             reopened.save(new Settings("secret", ""));
         }
         try (SettingsStore cleared = new SettingsStore(directory)) {

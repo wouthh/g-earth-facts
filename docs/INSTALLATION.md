@@ -19,8 +19,10 @@ Installation is staged into a temporary directory, checked for path traversal,
 then exchanged into the Steam profile. It changes only the dedicated Steam
 view and reads the canonical targets; the launcher still takes the existing
 shared profile lock before it starts G-Earth. Keep the previous version in the
-private workstation ledger until the next startup has been inspected. To roll
-back, stop the Steam G-Earth session and run
+private workstation ledger until the next startup has been inspected. Upgrades
+write a small private pending marker after the complete backup is made; a later
+install or rollback invocation restores that backup if replacement was
+interrupted. To roll back, stop the Steam G-Earth session and run
 `python3 scripts/install_steam.py --rollback`. The command keeps the current
 folder as a rollback backup and restores the newest retained version. Do not
 remove the shared extension targets, the profile lock, certificates, or other

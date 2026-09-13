@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 import zipfile
@@ -87,6 +88,34 @@ def main() -> None:
         assert (layout.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
         assert backup.exists() or any(layout.backup_root.iterdir())
         assert (layout.profile_extensions / "SharedTwo").is_symlink()
+
+        recover_root = root / "recover"
+        recover = make_layout(recover_root)
+        install(recover, first)
+        recover.backup_root.mkdir()
+        retained = recover.backup_root / "interrupted"
+        shutil.copytree(recover.plugin, retained)
+        shutil.rmtree(recover.plugin)
+        recover.pending_upgrade.write_text(
+            json.dumps({"schema": 1, "backup": retained.name}), encoding="utf-8"
+        )
+        install(recover, second)
+        assert (recover.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
+        assert not recover.pending_upgrade.exists()
+
+        unknown_root = root / "unknown"
+        unknown = make_layout(unknown_root)
+        unknown.profile.mkdir(parents=True)
+        unknown.profile_extensions.mkdir()
+        (unknown.profile_extensions / "Unmanaged").mkdir()
+        try:
+            install(unknown, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted an unrecognized Steam extension entry")
+        assert (unknown.profile_extensions / "Unmanaged").is_dir()
+        assert not unknown.plugin.exists()
 
         collision_root = root / "collision"
         collision = make_layout(collision_root)

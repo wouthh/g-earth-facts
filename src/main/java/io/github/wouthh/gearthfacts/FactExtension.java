@@ -30,6 +30,7 @@ public final class FactExtension extends Extension implements AutoCloseable {
     private final ApiNinjasFactClient factClient;
     private final ScheduledExecutorService executor;
     private final FactScheduler scheduler;
+    private final Object lifecycleLock = new Object();
     private volatile Settings settings;
     private volatile boolean origins;
     private volatile long roomId;
@@ -107,9 +108,17 @@ public final class FactExtension extends Extension implements AutoCloseable {
             publishStatus("Malformed room context; publishing paused");
             return;
         }
-        roomId = parsed.getAsLong();
-        scheduler.roomChanged(roomId);
-        publishStatus("Room " + roomId + " is ready");
+        long newRoomId = parsed.getAsLong();
+        long previousRoomId = roomId;
+        if (previousRoomId != newRoomId) {
+            // Close the send guard before waiting for the scheduler lock.  An old
+            // multipart callback must not be able to use the new room metadata.
+            roomId = 0;
+            scheduler.roomChanged(0);
+            roomId = newRoomId;
+        }
+        scheduler.roomChanged(newRoomId);
+        publishStatus("Room " + newRoomId + " is ready");
     }
 
     private void navigation(HMessage message) {
@@ -137,16 +146,19 @@ public final class FactExtension extends Extension implements AutoCloseable {
         if (Boolean.getBoolean("java.awt.headless") || closed.get()) return;
         SwingUtilities.invokeLater(
                 () -> {
-                    if (window == null) {
-                        window =
-                                new FactsWindow(
-                                        settings,
-                                        this::saveSettings,
-                                        this::startPublishing,
-                                        scheduler::stop,
-                                        this::savePrefix);
+                    synchronized (lifecycleLock) {
+                        if (closed.get()) return;
+                        if (window == null) {
+                            window =
+                                    new FactsWindow(
+                                            settings,
+                                            this::saveSettings,
+                                            this::startPublishing,
+                                            scheduler::stop,
+                                            this::savePrefix);
+                        }
+                        window.show(latest);
                     }
-                    window.show(latest);
                 });
     }
 
@@ -222,13 +234,16 @@ public final class FactExtension extends Extension implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!closed.compareAndSet(false, true)) return;
+        FactsWindow current;
+        synchronized (lifecycleLock) {
+            if (!closed.compareAndSet(false, true)) return;
+            current = window;
+        }
         scheduler.close();
         try {
             settingsStore.close();
         } catch (IOException ignored) {
         }
-        FactsWindow current = window;
         if (current != null) SwingUtilities.invokeLater(current::dispose);
     }
 

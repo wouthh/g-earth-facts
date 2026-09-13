@@ -54,6 +54,10 @@ class Layout:
     def receipt(self) -> Path:
         return self.profile / ".g-earth-facts-install.json"
 
+    @property
+    def pending_upgrade(self) -> Path:
+        return self.profile.parent / f".{PLUGIN_DIR}.upgrade.json"
+
 
 def default_layout() -> Layout:
     home = Path.home()
@@ -182,6 +186,48 @@ def _known_plugin(path: Path) -> bool:
     )
 
 
+def _read_pending_upgrade(layout: Layout) -> Path | None:
+    """Recover an interrupted replacement before inspecting the Steam view."""
+    pending = layout.pending_upgrade
+    if not _lexists(pending):
+        return None
+    if pending.is_symlink() or not pending.is_file():
+        raise InstallError(f"Pending upgrade marker is not a regular file: {pending}")
+    try:
+        state = json.loads(pending.read_text(encoding="utf-8"))
+        backup_name = state["backup"]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+        raise InstallError(f"Pending upgrade marker is invalid: {pending}")
+    if (
+        not isinstance(backup_name, str)
+        or not backup_name
+        or Path(backup_name).name != backup_name
+        or Path(backup_name).is_absolute()
+    ):
+        raise InstallError(f"Pending upgrade marker has an unsafe backup: {pending}")
+    backup = layout.backup_root / backup_name
+    if not _known_plugin(backup):
+        raise InstallError(f"Pending upgrade backup is unavailable: {backup}")
+    if _lexists(layout.plugin):
+        if not _known_plugin(layout.plugin):
+            raise InstallError(f"Steam plugin is unfamiliar while recovering: {layout.plugin}")
+        # The replacement reached its destination before the marker was cleared.
+        pending.unlink()
+        return backup
+
+    if not layout.profile_extensions.is_dir() or layout.profile_extensions.is_symlink():
+        raise InstallError(f"Steam Extensions directory is unavailable: {layout.profile_extensions}")
+    restore = layout.profile_extensions / f".{PLUGIN_DIR}.restore"
+    if _lexists(restore):
+        if restore.is_symlink() or not restore.is_dir():
+            raise InstallError(f"Steam restore staging path is unsafe: {restore}")
+        shutil.rmtree(restore)
+    shutil.copytree(backup, restore, symlinks=True)
+    os.replace(restore, layout.plugin)
+    pending.unlink()
+    return backup
+
+
 def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Path | None]:
     _require_directory(layout.shared_app, "shared G-Earth directory")
     _require_directory(layout.shared_extensions, "shared Extensions directory")
@@ -191,6 +237,11 @@ def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Pat
     _require_directory(layout.profile_extensions, "Steam Extensions directory", allow_missing=True)
 
     shared_children = sorted(layout.shared_extensions.iterdir(), key=lambda path: path.name)
+    expected_names = {PLUGIN_DIR, *(child.name for child in shared_children)}
+    if layout.profile_extensions.is_dir():
+        for child in layout.profile_extensions.iterdir():
+            if child.name not in expected_names:
+                raise InstallError(f"Unrecognized Steam extension entry: {child}")
     for child in shared_children:
         if child.name == PLUGIN_DIR:
             raise InstallError(f"The shared profile already owns {PLUGIN_DIR}")
@@ -246,6 +297,7 @@ def _backup_name(root: Path) -> Path:
 def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     """Install one package, preserving existing entries and an upgrade backup."""
     validate_package(zip_path)
+    _read_pending_upgrade(layout)
     shared_children, cert_links, old_plugin = _preflight(layout)
     layout.profile.mkdir(parents=True, exist_ok=True)
     layout.profile_extensions.mkdir(parents=True, exist_ok=True)
@@ -255,12 +307,15 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     created_links: list[Path] = []
     created_certs: list[Path] = []
     previous_receipt = layout.receipt.read_bytes() if layout.receipt.is_file() else None
+    pending_written = False
     try:
         stage_root = _extract_package(zip_path, stage_parent)
         if old_plugin is not None:
             layout.backup_root.mkdir(mode=0o700, exist_ok=True)
             backup = _backup_name(layout.backup_root)
             shutil.copytree(old_plugin, backup, symlinks=True)
+            pending_written = True
+            _atomic_json(layout.pending_upgrade, {"schema": 1, "backup": backup.name})
             shutil.rmtree(old_plugin)
         os.replace(stage_root, layout.plugin)
         plugin_replaced = True
@@ -283,12 +338,20 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
                 "certificates": [destination.name for destination, _ in cert_links],
             },
         )
+        if pending_written:
+            layout.pending_upgrade.unlink(missing_ok=True)
     except Exception as exc:
         for path in [*created_links, *created_certs]:
             if _lexists(path):
                 path.unlink()
         if plugin_replaced and _lexists(layout.plugin):
             shutil.rmtree(layout.plugin)
+        if pending_written and backup is not None and not _lexists(layout.plugin):
+            restore = layout.profile_extensions / f".{PLUGIN_DIR}.restore"
+            shutil.copytree(backup, restore, symlinks=True)
+            os.replace(restore, layout.plugin)
+        if pending_written:
+            layout.pending_upgrade.unlink(missing_ok=True)
         if backup is not None and _lexists(backup) and not _lexists(layout.plugin):
             shutil.move(backup, layout.plugin)
         if previous_receipt is None:
@@ -310,8 +373,9 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
 
 def rollback(layout: Layout) -> dict[str, object]:
     """Restore the newest retained plugin backup without touching shared links."""
+    _read_pending_upgrade(layout)
     _require_directory(layout.profile_extensions, "Steam Extensions directory")
-    if not _known_plugin(layout.plugin):
+    if _lexists(layout.plugin) and not _known_plugin(layout.plugin):
         raise InstallError(f"Current Steam plugin is missing or unfamiliar: {layout.plugin}")
     if not layout.backup_root.is_dir() or layout.backup_root.is_symlink():
         raise InstallError("No retained G-Earth Facts backup is available")
@@ -321,14 +385,16 @@ def rollback(layout: Layout) -> dict[str, object]:
     )
     if not backups:
         raise InstallError("No retained G-Earth Facts backup is available")
-    current = _backup_name(layout.backup_root)
-    shutil.move(layout.plugin, current)
+    current: Path | None = None
+    if _lexists(layout.plugin):
+        current = _backup_name(layout.backup_root)
+        shutil.move(layout.plugin, current)
     shutil.move(backups[-1], layout.plugin)
     _atomic_json(
         layout.receipt,
         {"schema": 1, "plugin": PLUGIN_DIR, "rollback": backups[-1].name},
     )
-    return {"restored": str(layout.plugin), "previous": str(current)}
+    return {"restored": str(layout.plugin), "previous": str(current) if current else None}
 
 
 def _parse_args() -> argparse.Namespace:

@@ -1,8 +1,7 @@
 package io.github.wouthh.gearthfacts.runtime;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.Reader;
-import java.io.StringWriter;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.channels.OverlappingFileLockException;
@@ -67,8 +66,10 @@ public final class SettingsStore implements AutoCloseable {
                 || Files.size(settingsFile) > MAX_BYTES)
             throw new IOException("Invalid G-Earth Facts settings file");
         Properties properties = new Properties();
-        try (Reader reader = Files.newBufferedReader(settingsFile, StandardCharsets.UTF_8)) {
-            properties.load(reader);
+        try (var input = Files.newInputStream(settingsFile)) {
+            // Properties' stream form is ISO-8859-1 with Unicode escapes.  Keep the
+            // same format on both sides so a Latin-1 prefix survives a restart.
+            properties.load(input);
         } catch (IllegalArgumentException e) {
             throw new IOException("Invalid G-Earth Facts settings encoding", e);
         }
@@ -85,9 +86,9 @@ public final class SettingsStore implements AutoCloseable {
         properties.setProperty("schema", "1");
         properties.setProperty("apiKey", settings.apiKey());
         properties.setProperty("prefix", settings.prefix());
-        StringWriter writer = new StringWriter();
-        properties.store(writer, "G-Earth Facts local settings");
-        atomicWrite(settingsFile, writer.toString().getBytes(StandardCharsets.ISO_8859_1));
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        properties.store(output, "G-Earth Facts local settings");
+        atomicWrite(settingsFile, output.toByteArray());
     }
 
     private void atomicWrite(Path target, byte[] bytes) throws IOException {
