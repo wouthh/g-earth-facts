@@ -491,7 +491,9 @@ def _read_pending_rollback(layout: Layout) -> dict[str, str | None] | None:
     }
 
 
-def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Path | None]:
+def _preflight(
+    layout: Layout,
+) -> tuple[list[Path], list[tuple[Path, Path]], list[tuple[Path, Path]], Path | None]:
     _require_directory(layout.shared_app, "shared G-Earth directory")
     _require_directory(layout.shared_extensions, "shared Extensions directory")
     if not layout.profile.parent.is_dir() or layout.profile.parent.is_symlink():
@@ -505,13 +507,15 @@ def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Pat
     shared_children = sorted(layout.shared_extensions.iterdir(), key=lambda path: path.name)
     shared_names = {child.name for child in shared_children}
     managed_links = _read_receipt_managed_links(layout.profile)
+    stale_links: list[tuple[Path, Path]] = []
     for name in sorted(managed_links - shared_names):
         destination = layout.profile_extensions / name
+        source = layout.shared_extensions / name
+        stale_links.append((destination, source))
         if not _lexists(destination):
             continue
-        if not _same_unresolved_target(destination, layout.shared_extensions / name):
+        if not _same_unresolved_target(destination, source):
             raise InstallError(f"Steam extension-link collision: {destination}")
-        destination.unlink()
     managed_name = layout.plugin.name
     expected_names = {PLUGIN_DIR, managed_name, *shared_names, *managed_links}
     if layout.profile_extensions.is_dir():
@@ -552,7 +556,7 @@ def _preflight(layout: Layout) -> tuple[list[Path], list[tuple[Path, Path]], Pat
             raise InstallError(
                 f"Steam certificate path must be a real file when shared source is absent: {destination}"
             )
-    return shared_children, cert_links, old_plugin
+    return shared_children, cert_links, stale_links, old_plugin
 
 
 def _atomic_json(path: Path, value: dict[str, object]) -> None:
@@ -643,7 +647,7 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     _read_pending_rollback(layout)
     recovered_backup = _read_pending_upgrade(layout)
     _require_receipt_for_existing_plugin(layout)
-    shared_children, cert_links, old_plugin = _preflight(layout)
+    shared_children, cert_links, stale_links, old_plugin = _preflight(layout)
     layout.profile.mkdir(parents=True, exist_ok=True)
     layout.profile_extensions.mkdir(parents=True, exist_ok=True)
     stage_parent = Path(tempfile.mkdtemp(prefix=".g-earth-facts-stage-", dir=layout.profile.parent))
@@ -652,6 +656,7 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     plugin_replaced = False
     created_links: list[Path] = []
     created_certs: list[Path] = []
+    removed_stale_links: list[tuple[Path, Path]] = []
     previous_receipt = layout.receipt.read_bytes() if layout.receipt.is_file() else None
     pending_written = False
     first_install_marker = old_plugin is None and _read_receipt_plugin_name(layout.profile) is None
@@ -691,6 +696,13 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
                 pending_written = True
                 _atomic_json(layout.pending_upgrade, {"schema": 1, "backup": backup.name})
             shutil.rmtree(old_plugin)
+        for destination, source in stale_links:
+            if not _lexists(destination):
+                continue
+            if not _same_unresolved_target(destination, source):
+                raise InstallError(f"Steam extension-link collision: {destination}")
+            destination.unlink()
+            removed_stale_links.append((destination, source))
         os.replace(stage_root, layout.plugin)
         plugin_replaced = True
         for child in shared_children:
@@ -715,6 +727,9 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
         if pending_written:
             layout.pending_upgrade.unlink(missing_ok=True)
     except Exception as exc:
+        for destination, source in removed_stale_links:
+            if not _lexists(destination):
+                os.symlink(source, destination, target_is_directory=True)
         for path in [*created_links, *created_certs]:
             if _lexists(path):
                 path.unlink()
