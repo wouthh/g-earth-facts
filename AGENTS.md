@@ -31,6 +31,7 @@ python3 scripts/bootstrap.py
 python3 scripts/check-public.py
 python3 scripts/check.py
 python3 scripts/test-install.py
+python3 scripts/test-packaged.py
 ```
 
 `scripts/check.py` is the canonical local gate. It bootstraps the immutable
