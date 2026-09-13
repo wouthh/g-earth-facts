@@ -6,6 +6,8 @@ if __name__ == "__main__" and not (sys.flags.isolated and sys.dont_write_bytecod
     native_os = __import__("posix" if "posix" in sys.builtin_module_names else "nt")
     native_os.execv(sys.executable, [sys.executable, "-I", "-B", __file__, *sys.argv[1:]])
 
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
+
 import os
 from pathlib import Path
 import subprocess
