@@ -98,6 +98,13 @@ def main() -> None:
         assert (layout.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
         assert backup.exists() or any(layout.backup_root.iterdir())
         assert (layout.profile_extensions / "SharedTwo").is_symlink()
+        assert json.loads(layout.receipt.read_text(encoding="utf-8"))["managedLinks"] == [
+            "SharedOne",
+            "SharedTwo",
+        ]
+        shutil.rmtree(layout.shared_extensions / "SharedOne")
+        install(layout, second)
+        assert not (layout.profile_extensions / "SharedOne").exists()
 
         recover_root = root / "recover"
         recover = make_layout(recover_root)
@@ -292,6 +299,10 @@ def main() -> None:
         )
         rollback(rollback_layout)
         assert (rollback_layout.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+        assert json.loads(rollback_layout.receipt.read_text(encoding="utf-8"))["managedLinks"] == [
+            "SharedOne",
+            "SharedTwo",
+        ]
 
         unknown_root = root / "unknown"
         unknown = make_layout(unknown_root)

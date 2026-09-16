@@ -773,11 +773,17 @@ def rollback(layout: Layout) -> dict[str, object]:
     _ensure_receipt_safe(layout)
     _read_pending_upgrade(layout)
     _require_receipt_for_existing_plugin(layout)
+    managed_links = sorted(_read_receipt_managed_links(layout.profile))
     recovered = _read_pending_rollback(layout)
     if recovered is not None:
         _atomic_json(
             layout.receipt,
-            {"schema": 1, "plugin": layout.plugin.name, "rollback": recovered["target"]},
+            {
+                "schema": 1,
+                "plugin": layout.plugin.name,
+                "managedLinks": managed_links,
+                "rollback": recovered["target"],
+            },
         )
         return {"restored": str(layout.plugin), "previous": recovered["current"]}
     _require_directory(layout.profile_extensions, "Steam Extensions directory")
@@ -817,7 +823,12 @@ def rollback(layout: Layout) -> dict[str, object]:
         os.replace(target, layout.plugin)
         _atomic_json(
             layout.receipt,
-            {"schema": 1, "plugin": layout.plugin.name, "rollback": target.name},
+            {
+                "schema": 1,
+                "plugin": layout.plugin.name,
+                "managedLinks": managed_links,
+                "rollback": target.name,
+            },
         )
         if pending_written:
             layout.pending_rollback.unlink(missing_ok=True)
