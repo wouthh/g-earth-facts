@@ -152,6 +152,24 @@ def _read_receipt_managed_links(profile: Path) -> set[str]:
     return set(links)
 
 
+def _valid_transaction_token(token: object) -> bool:
+    return isinstance(token, str) and re.fullmatch(r"[0-9a-f]{32}", token) is not None
+
+
+def _read_transaction_token(plugin: Path) -> str | None:
+    token_path = plugin / FIRST_INSTALL_TOKEN
+    if token_path.is_symlink() or not token_path.is_file():
+        return None
+    try:
+        token = token_path.read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not token.endswith("\n"):
+        return None
+    token = token[:-1]
+    return token if _valid_transaction_token(token) else None
+
+
 def _receipt_plugin_name(profile: Path) -> str:
     """Return the previously managed folder, or this build's default name."""
     return _read_receipt_plugin_name(profile) or PLUGIN_DIR
@@ -314,6 +332,22 @@ def _known_plugin(path: Path) -> bool:
     )
 
 
+def _validate_managed_links(layout: Layout, managed_links: set[str]) -> None:
+    """Refuse replaced or unrelated profile links before a state transition."""
+    _require_directory(layout.shared_extensions, "shared Extensions directory")
+    for name in sorted(managed_links):
+        source = layout.shared_extensions / name
+        destination = layout.profile_extensions / name
+        if not _lexists(destination):
+            continue
+        if _lexists(source):
+            matches = _same_target(destination, source)
+        else:
+            matches = _same_unresolved_target(destination, source)
+        if not matches:
+            raise InstallError(f"Steam extension-link collision: {destination}")
+
+
 def _remove_owned_plugin(path: Path) -> None:
     if not _lexists(path):
         return
@@ -409,6 +443,11 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
     if not _known_plugin(backup):
         raise InstallError(f"Pending upgrade backup is unavailable: {backup}")
     if _lexists(layout.plugin):
+        token = state.get("token")
+        if not _valid_transaction_token(token):
+            raise InstallError(f"Pending upgrade has no transaction binding: {pending}")
+        if _read_transaction_token(layout.plugin) != token:
+            raise InstallError(f"Steam plugin is unfamiliar while recovering: {layout.plugin}")
         if _known_plugin(layout.plugin):
             # The replacement reached its destination before the marker was cleared.
             pending.unlink()
@@ -507,6 +546,7 @@ def _preflight(
     shared_children = sorted(layout.shared_extensions.iterdir(), key=lambda path: path.name)
     shared_names = {child.name for child in shared_children}
     managed_links = _read_receipt_managed_links(layout.profile)
+    _validate_managed_links(layout, managed_links)
     stale_links: list[tuple[Path, Path]] = []
     for name in sorted(managed_links - shared_names):
         destination = layout.profile_extensions / name
@@ -637,12 +677,30 @@ def _ensure_backup_root_safe(layout: Layout) -> None:
         )
 
 
+def _validated_backups(layout: Layout) -> list[Path]:
+    if not _lexists(layout.backup_root):
+        return []
+    if layout.backup_root.is_symlink() or not layout.backup_root.is_dir():
+        raise InstallError(f"Steam backup directory must be a real directory: {layout.backup_root}")
+    entries = sorted(layout.backup_root.iterdir(), key=lambda path: path.name)
+    unfamiliar = [
+        path for path in entries if not _generated_backup(path) or not _known_plugin(path)
+    ]
+    if unfamiliar:
+        raise InstallError(f"Unrecognized Steam backup entry: {unfamiliar[0]}")
+    return sorted(
+        (path for path in entries if _generated_backup(path)),
+        key=_backup_timestamp,
+    )
+
+
 def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     """Install one package, preserving existing entries and an upgrade backup."""
     layout = _absolute_layout(layout)
     validate_package(zip_path)
     _ensure_profile_isolated(layout)
     _ensure_backup_root_safe(layout)
+    _validated_backups(layout)
     _ensure_receipt_safe(layout)
     _read_pending_rollback(layout)
     recovered_backup = _read_pending_upgrade(layout)
@@ -662,16 +720,18 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     first_install_marker = old_plugin is None and _read_receipt_plugin_name(layout.profile) is None
     try:
         stage_root = _extract_package(zip_path, stage_parent)
+        transaction_token = secrets.token_hex(16)
+        (stage_root / FIRST_INSTALL_TOKEN).write_text(
+            transaction_token + "\n", encoding="ascii"
+        )
         if first_install_marker:
-            token = secrets.token_hex(16)
-            (stage_root / FIRST_INSTALL_TOKEN).write_text(token + "\n", encoding="ascii")
             _atomic_json(
                 layout.pending_upgrade,
                 {
                     "schema": 1,
                     "operation": "first-install",
                     "plugin": layout.plugin.name,
-                    "token": token,
+                    "token": transaction_token,
                 },
             )
             pending_written = True
@@ -680,7 +740,15 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
                 # Recovery already retained the pre-upgrade plugin. Reuse that
                 # backup so a retry cannot make rollback restore the replacement.
                 backup = recovered_backup
-                _atomic_json(layout.pending_upgrade, {"schema": 1, "backup": backup.name})
+                _atomic_json(
+                    layout.pending_upgrade,
+                    {
+                        "schema": 1,
+                        "operation": "upgrade",
+                        "backup": backup.name,
+                        "token": transaction_token,
+                    },
+                )
                 pending_written = True
             else:
                 layout.backup_root.mkdir(mode=0o700, exist_ok=True)
@@ -694,7 +762,15 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
                 if not _known_plugin(backup):
                     raise InstallError(f"Steam plugin backup is incomplete: {backup}")
                 pending_written = True
-                _atomic_json(layout.pending_upgrade, {"schema": 1, "backup": backup.name})
+                _atomic_json(
+                    layout.pending_upgrade,
+                    {
+                        "schema": 1,
+                        "operation": "upgrade",
+                        "backup": backup.name,
+                        "token": transaction_token,
+                    },
+                )
             shutil.rmtree(old_plugin)
         for destination, source in stale_links:
             if not _lexists(destination):
@@ -771,9 +847,10 @@ def rollback(layout: Layout) -> dict[str, object]:
     _ensure_profile_isolated(layout)
     _ensure_backup_root_safe(layout)
     _ensure_receipt_safe(layout)
+    managed_links = sorted(_read_receipt_managed_links(layout.profile))
+    _validate_managed_links(layout, set(managed_links))
     _read_pending_upgrade(layout)
     _require_receipt_for_existing_plugin(layout)
-    managed_links = sorted(_read_receipt_managed_links(layout.profile))
     recovered = _read_pending_rollback(layout)
     if recovered is not None:
         _atomic_json(
@@ -789,18 +866,7 @@ def rollback(layout: Layout) -> dict[str, object]:
     _require_directory(layout.profile_extensions, "Steam Extensions directory")
     if _lexists(layout.plugin) and not _known_plugin(layout.plugin):
         raise InstallError(f"Current Steam plugin is missing or unfamiliar: {layout.plugin}")
-    if not layout.backup_root.is_dir() or layout.backup_root.is_symlink():
-        raise InstallError("No retained G-Earth Facts backup is available")
-    backup_entries = sorted(layout.backup_root.iterdir(), key=lambda path: path.name)
-    unfamiliar = [
-        path for path in backup_entries if not _generated_backup(path) or not _known_plugin(path)
-    ]
-    if unfamiliar:
-        raise InstallError(f"Unrecognized Steam backup entry: {unfamiliar[0]}")
-    backups = sorted(
-        (path for path in backup_entries if _generated_backup(path)),
-        key=_backup_timestamp,
-    )
+    backups = _validated_backups(layout)
     if not backups:
         raise InstallError("No retained G-Earth Facts backup is available")
     current: Path | None = None

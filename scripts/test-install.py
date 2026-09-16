@@ -110,7 +110,7 @@ def main() -> None:
         recover = make_layout(recover_root)
         install(recover, first)
         recover.backup_root.mkdir()
-        retained = recover.backup_root / "interrupted"
+        retained = recover.backup_root / "G-Earth-Facts-0.1.0-20990101T010100.000000Z"
         shutil.copytree(recover.plugin, retained)
         shutil.rmtree(recover.plugin)
         recover.pending_upgrade.write_text(
@@ -125,22 +125,66 @@ def main() -> None:
         install(exposed, first)
         install(exposed, second)
         original_backup = next(path for path in exposed.backup_root.iterdir() if path.is_dir())
+        exposed_token = (exposed.plugin / FIRST_INSTALL_TOKEN).read_text(encoding="ascii").strip()
         exposed.pending_upgrade.write_text(
-            json.dumps({"schema": 1, "backup": original_backup.name}), encoding="utf-8"
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "upgrade",
+                    "backup": original_backup.name,
+                    "token": exposed_token,
+                }
+            ),
+            encoding="utf-8",
         )
         install(exposed, second)
         rollback(exposed)
         assert (exposed.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
 
+        bound_root = root / "bound-upgrade"
+        bound = make_layout(bound_root)
+        install(bound, first)
+        install(bound, second)
+        bound_backup = next(path for path in bound.backup_root.iterdir() if path.is_dir())
+        bound.pending_upgrade.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "upgrade",
+                    "backup": bound_backup.name,
+                    "token": "d" * 32,
+                }
+            ),
+            encoding="utf-8",
+        )
+        current_bytes = (bound.plugin / "extension/G-Earth-Facts.jar").read_bytes()
+        try:
+            install(bound, second)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("upgrade recovery removed an unbound destination")
+        assert (bound.plugin / "extension/G-Earth-Facts.jar").read_bytes() == current_bytes
+        assert bound.pending_upgrade.exists()
+
         partial_root = root / "partial-recover"
         partial = make_layout(partial_root)
         install(partial, first)
         partial.backup_root.mkdir()
-        retained_partial = partial.backup_root / "interrupted-partial"
+        retained_partial = partial.backup_root / "G-Earth-Facts-0.1.0-20990101T010200.000000Z"
         shutil.copytree(partial.plugin, retained_partial)
+        partial_token = (partial.plugin / FIRST_INSTALL_TOKEN).read_text(encoding="ascii").strip()
         (partial.plugin / "extension" / "G-Earth-Facts.jar").unlink()
         partial.pending_upgrade.write_text(
-            json.dumps({"schema": 1, "backup": retained_partial.name}), encoding="utf-8"
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "upgrade",
+                    "backup": retained_partial.name,
+                    "token": partial_token,
+                }
+            ),
+            encoding="utf-8",
         )
         install(partial, second)
         assert (partial.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
@@ -233,7 +277,9 @@ def main() -> None:
         restore_collision = make_layout(restore_collision_root)
         install(restore_collision, first)
         restore_collision.backup_root.mkdir()
-        retained_restore = restore_collision.backup_root / "interrupted-restore"
+        retained_restore = (
+            restore_collision.backup_root / "G-Earth-Facts-0.1.0-20990101T010300.000000Z"
+        )
         shutil.copytree(restore_collision.plugin, retained_restore)
         shutil.rmtree(restore_collision.plugin)
         restore_stage = restore_collision.profile_extensions / ".G-Earth-Facts.restore"
@@ -284,7 +330,9 @@ def main() -> None:
         rollback_target = next(
             path for path in rollback_layout.backup_root.iterdir() if path.is_dir()
         )
-        interrupted_current = rollback_layout.backup_root / "interrupted-current"
+        interrupted_current = (
+            rollback_layout.backup_root / "G-Earth-Facts-0.1.0-20990101T010400.000000Z"
+        )
         os.replace(rollback_layout.plugin, interrupted_current)
         rollback_layout.pending_rollback.write_text(
             json.dumps(
@@ -303,6 +351,24 @@ def main() -> None:
             "SharedOne",
             "SharedTwo",
         ]
+
+        link_collision_root = root / "rollback-link-collision"
+        link_collision = make_layout(link_collision_root)
+        install(link_collision, first)
+        install(link_collision, second)
+        link_collision_destination = link_collision.profile_extensions / "SharedOne"
+        link_collision_destination.unlink()
+        link_collision_destination.mkdir()
+        current_bytes = (link_collision.plugin / "extension/G-Earth-Facts.jar").read_bytes()
+        receipt_bytes = link_collision.receipt.read_bytes()
+        try:
+            rollback(link_collision)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback accepted a replaced managed link")
+        assert (link_collision.plugin / "extension/G-Earth-Facts.jar").read_bytes() == current_bytes
+        assert link_collision.receipt.read_bytes() == receipt_bytes
 
         unknown_root = root / "unknown"
         unknown = make_layout(unknown_root)
@@ -603,6 +669,25 @@ def main() -> None:
         else:
             raise AssertionError("rollback accepted an unfamiliar backup entry")
         assert (backup_collision.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
+
+        upgrade_backup_collision_root = root / "upgrade-backup-collision"
+        upgrade_backup_collision = make_layout(upgrade_backup_collision_root)
+        install(upgrade_backup_collision, first)
+        install(upgrade_backup_collision, second)
+        untrusted_upgrade_backup = upgrade_backup_collision.backup_root / "untrusted"
+        shutil.copytree(upgrade_backup_collision.plugin, untrusted_upgrade_backup)
+        current_bytes = (
+            upgrade_backup_collision.plugin / "extension/G-Earth-Facts.jar"
+        ).read_bytes()
+        try:
+            install(upgrade_backup_collision, second)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("upgrade accepted an unfamiliar backup entry")
+        assert (
+            upgrade_backup_collision.plugin / "extension/G-Earth-Facts.jar"
+        ).read_bytes() == current_bytes
 
         duplicate = root / "duplicate.zip"
         with zipfile.ZipFile(duplicate, "w") as archive:

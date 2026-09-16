@@ -146,6 +146,7 @@ public final class FactsWindow {
 
     public void show(PublisherSnapshot value) {
         update(value);
+        countdownTimer.start();
         frame.setVisible(true);
         frame.toFront();
     }

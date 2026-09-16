@@ -44,8 +44,18 @@ public final class FactExtension extends Extension implements AutoCloseable {
 
     public FactExtension(String[] args) throws IOException {
         super(args);
-        settingsStore = new SettingsStore(SettingsStore.defaultDirectory());
-        settings = settingsStore.load();
+        SettingsStore openedSettingsStore = new SettingsStore(SettingsStore.defaultDirectory());
+        settingsStore = openedSettingsStore;
+        try {
+            settings = openedSettingsStore.load();
+        } catch (IOException | RuntimeException failure) {
+            try {
+                openedSettingsStore.close();
+            } catch (IOException closeFailure) {
+                failure.addSuppressed(closeFailure);
+            }
+            throw failure;
+        }
         factClient = new ApiNinjasFactClient();
         executor =
                 Executors.newSingleThreadScheduledExecutor(
