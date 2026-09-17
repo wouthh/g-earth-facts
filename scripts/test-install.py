@@ -548,9 +548,11 @@ def main() -> None:
         real_copytree = shutil.copytree
 
         def partial_copy(source, destination, *args, **kwargs):
+            copy_destinations.append(Path(destination))
             real_copytree(source, destination, *args, **kwargs)
             raise OSError("synthetic copy failure")
 
+        copy_destinations: list[Path] = []
         with patch("install_steam.shutil.copytree", side_effect=partial_copy):
             try:
                 install(copy_failure, second)
@@ -560,6 +562,8 @@ def main() -> None:
                 raise AssertionError("installer accepted a failed backup copy")
         assert (copy_failure.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
         assert not list(copy_failure.backup_root.iterdir())
+        assert copy_destinations
+        assert copy_destinations[0].parent == copy_failure.profile.parent
 
         backup_name_collision_root = root / "backup-name-collision"
         backup_name_collision = make_layout(backup_name_collision_root)
@@ -642,6 +646,50 @@ def main() -> None:
         else:
             raise AssertionError("rollback accepted an unfamiliar receipt entry")
         assert (receipt_collision.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
+
+        malformed_receipt_root = root / "malformed-receipt"
+        malformed_receipt = make_layout(malformed_receipt_root)
+        malformed_receipt.profile.mkdir(parents=True)
+        malformed_receipt.receipt.write_text("{not-json", encoding="utf-8")
+        receipt_bytes = malformed_receipt.receipt.read_bytes()
+        try:
+            install(malformed_receipt, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a malformed receipt")
+        assert malformed_receipt.receipt.read_bytes() == receipt_bytes
+        assert not malformed_receipt.plugin.exists()
+
+        invalid_receipt_root = root / "invalid-receipt"
+        invalid_receipt = make_layout(invalid_receipt_root)
+        invalid_receipt.profile.mkdir(parents=True)
+        invalid_receipt.receipt.write_text(
+            json.dumps({"schema": 1, "plugin": "unrelated-plugin"}), encoding="utf-8"
+        )
+        try:
+            install(invalid_receipt, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer accepted a receipt with an invalid plugin")
+        assert not invalid_receipt.plugin.exists()
+
+        rollback_unknown_root = root / "rollback-unknown-entry"
+        rollback_unknown = make_layout(rollback_unknown_root)
+        install(rollback_unknown, first)
+        install(rollback_unknown, second)
+        unknown_entry = rollback_unknown.profile_extensions / "Unmanaged"
+        unknown_entry.mkdir()
+        current_bytes = (rollback_unknown.plugin / "extension/G-Earth-Facts.jar").read_bytes()
+        try:
+            rollback(rollback_unknown)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback accepted an unrecognized Steam extension entry")
+        assert unknown_entry.is_dir()
+        assert (rollback_unknown.plugin / "extension/G-Earth-Facts.jar").read_bytes() == current_bytes
 
         timestamp_root = root / "timestamp-order"
         timestamp = make_layout(timestamp_root)

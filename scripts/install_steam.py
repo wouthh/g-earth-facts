@@ -185,10 +185,20 @@ def _require_directory(path: Path, label: str, allow_missing: bool = False) -> N
 
 
 def _ensure_receipt_safe(layout: Layout) -> None:
-    if _lexists(layout.receipt) and (
-        layout.receipt.is_symlink() or not layout.receipt.is_file()
-    ):
+    if not _lexists(layout.receipt):
+        return
+    if layout.receipt.is_symlink() or not layout.receipt.is_file():
         raise InstallError(f"Steam installation receipt is not a regular file: {layout.receipt}")
+    try:
+        state = json.loads(layout.receipt.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise InstallError(f"Steam installation receipt is invalid: {layout.receipt}")
+    if (
+        not isinstance(state, dict)
+        or state.get("schema") != 1
+        or not _valid_plugin_name(state.get("plugin"))
+    ):
+        raise InstallError(f"Steam installation receipt is invalid: {layout.receipt}")
 
 
 def _require_receipt_for_existing_plugin(layout: Layout) -> None:
@@ -618,6 +628,26 @@ def _backup_name(root: Path) -> Path:
     return root / f"{PLUGIN_DIR}-{stamp}"
 
 
+def _create_backup(layout: Layout, source: Path) -> Path:
+    """Copy a retained plugin outside the inventory, then publish it atomically."""
+    layout.backup_root.mkdir(mode=0o700, exist_ok=True)
+    backup = _backup_name(layout.backup_root)
+    if _lexists(backup):
+        raise InstallError(f"Steam backup path already exists: {backup}")
+    staging = Path(
+        tempfile.mkdtemp(prefix=".g-earth-facts-backup-stage-", dir=layout.profile.parent)
+    )
+    try:
+        shutil.copytree(source, staging, symlinks=True, dirs_exist_ok=True)
+        if not _known_plugin(staging):
+            raise InstallError(f"Steam plugin backup is incomplete: {staging}")
+        os.replace(staging, backup)
+        return backup
+    finally:
+        if _lexists(staging):
+            _remove_owned_plugin(staging)
+
+
 def _generated_backup(path: Path) -> bool:
     return (
         path.is_dir()
@@ -751,16 +781,8 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
                 )
                 pending_written = True
             else:
-                layout.backup_root.mkdir(mode=0o700, exist_ok=True)
-                backup = _backup_name(layout.backup_root)
-                try:
-                    backup.mkdir(mode=0o700)
-                except FileExistsError as exc:
-                    raise InstallError(f"Steam backup path already exists: {backup}") from exc
+                backup = _create_backup(layout, old_plugin)
                 backup_created = True
-                shutil.copytree(old_plugin, backup, symlinks=True, dirs_exist_ok=True)
-                if not _known_plugin(backup):
-                    raise InstallError(f"Steam plugin backup is incomplete: {backup}")
                 pending_written = True
                 _atomic_json(
                     layout.pending_upgrade,
@@ -850,6 +872,7 @@ def rollback(layout: Layout) -> dict[str, object]:
     managed_links = sorted(_read_receipt_managed_links(layout.profile))
     _validate_managed_links(layout, set(managed_links))
     _read_pending_upgrade(layout)
+    _preflight(layout)
     _require_receipt_for_existing_plugin(layout)
     recovered = _read_pending_rollback(layout)
     if recovered is not None:
