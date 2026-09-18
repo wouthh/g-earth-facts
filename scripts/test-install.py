@@ -18,6 +18,7 @@ from install_steam import (
     InstallError,
     Layout,
     PLUGIN_DIR,
+    RESTORE_MARKER,
     _read_pending_upgrade,
     install,
     rollback,
@@ -298,6 +299,50 @@ def main() -> None:
             raise AssertionError("installer deleted an occupied restore staging path")
         assert (restore_stage / "keep.txt").read_text(encoding="utf-8") == "preserve"
 
+        restore_resume_root = root / "restore-resume"
+        restore_resume = make_layout(restore_resume_root)
+        install(restore_resume, first)
+        install(restore_resume, second)
+        restore_resume_backup = next(path for path in restore_resume.backup_root.iterdir())
+        shutil.rmtree(restore_resume.plugin)
+        restore_resume_stage = restore_resume.profile_extensions / ".G-Earth-Facts.restore"
+        restore_resume_stage.mkdir()
+        shutil.copytree(
+            restore_resume_backup,
+            restore_resume_stage,
+            symlinks=True,
+            dirs_exist_ok=True,
+        )
+        restore_resume_token = "d" * 32
+        (restore_resume_stage / RESTORE_MARKER).write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "restore",
+                    "backup": restore_resume_backup.name,
+                    "token": restore_resume_token,
+                }
+            ),
+            encoding="utf-8",
+        )
+        restore_resume.pending_upgrade.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "upgrade",
+                    "backup": restore_resume_backup.name,
+                    "token": restore_resume_token,
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert _read_pending_upgrade(restore_resume) == restore_resume_backup
+        assert (
+            restore_resume.plugin / "extension/G-Earth-Facts.jar"
+        ).read_bytes() == b"version one"
+        assert not (restore_resume.plugin / RESTORE_MARKER).exists()
+        assert not restore_resume_stage.exists()
+
         recovery_collision_root = root / "recovery-destination-collision"
         recovery_collision = make_layout(recovery_collision_root)
         install(recovery_collision, first)
@@ -435,6 +480,36 @@ def main() -> None:
             "SharedOne",
             "SharedTwo",
         ]
+
+        install_after_rollback_root = root / "install-after-rollback-recovery"
+        install_after_rollback = make_layout(install_after_rollback_root)
+        install(install_after_rollback, first)
+        install(install_after_rollback, second)
+        install_after_rollback_target = next(
+            path for path in install_after_rollback.backup_root.iterdir() if path.is_dir()
+        )
+        install_after_rollback_current = (
+            install_after_rollback.backup_root
+            / "G-Earth-Facts-0.1.0-20990101T010600.000000Z"
+        )
+        os.replace(install_after_rollback.plugin, install_after_rollback_current)
+        os.replace(install_after_rollback_target, install_after_rollback.plugin)
+        install_after_rollback.pending_rollback.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "rollback",
+                    "target": install_after_rollback_target.name,
+                    "current": install_after_rollback_current.name,
+                }
+            ),
+            encoding="utf-8",
+        )
+        install(install_after_rollback, second)
+        assert (
+            install_after_rollback.plugin / "extension/G-Earth-Facts.jar"
+        ).read_bytes() == b"version two"
+        assert not install_after_rollback.pending_rollback.exists()
 
         receipt_recovery_root = root / "rollback-receipt-recovery"
         receipt_recovery = make_layout(receipt_recovery_root)
@@ -887,6 +962,34 @@ def main() -> None:
         assert untrusted_marker_backup.is_dir()
         assert marker_backup_collision.pending_upgrade.exists()
 
+        rollback_marker_collision_root = root / "rollback-marker-collision"
+        rollback_marker_collision = make_layout(rollback_marker_collision_root)
+        install(rollback_marker_collision, first)
+        install(rollback_marker_collision, second)
+        untrusted_rollback_backup = rollback_marker_collision.backup_root / "untrusted"
+        shutil.copytree(rollback_marker_collision.plugin, untrusted_rollback_backup)
+        shutil.rmtree(rollback_marker_collision.plugin)
+        rollback_marker_collision.pending_rollback.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "rollback",
+                    "target": untrusted_rollback_backup.name,
+                    "current": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            rollback(rollback_marker_collision)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback accepted an unrecognized marker backup")
+        assert untrusted_rollback_backup.is_dir()
+        assert not rollback_marker_collision.plugin.exists()
+        assert rollback_marker_collision.pending_rollback.exists()
+
         atomic_receipt_root = root / "atomic-receipt-recovery"
         atomic_receipt = make_layout(atomic_receipt_root)
         install(atomic_receipt, first)
@@ -924,6 +1027,40 @@ def main() -> None:
             else:
                 raise AssertionError("install hid a synthetic pending marker failure")
         assert atomic_receipt.receipt.read_bytes() == previous_receipt
+
+        receipt_order_root = root / "receipt-order"
+        receipt_order = make_layout(receipt_order_root)
+        install(receipt_order, first)
+        install(receipt_order, second)
+        real_atomic_json = install_steam._atomic_json
+        real_atomic_bytes = install_steam._atomic_bytes
+
+        def fail_final_receipt(path, value):
+            if path == receipt_order.receipt:
+                raise OSError("synthetic final receipt failure")
+            return real_atomic_json(path, value)
+
+        def fail_recovery_receipt(path, value):
+            if path == receipt_order.receipt:
+                raise OSError("synthetic recovery receipt failure")
+            return real_atomic_bytes(path, value)
+
+        with patch(
+            "install_steam._atomic_json", side_effect=fail_final_receipt
+        ), patch("install_steam._atomic_bytes", side_effect=fail_recovery_receipt):
+            try:
+                install(receipt_order, second)
+            except OSError:
+                pass
+            else:
+                raise AssertionError("install hid a synthetic receipt restoration failure")
+        assert receipt_order.pending_upgrade.exists()
+        assert (
+            receipt_order.plugin / "extension/G-Earth-Facts.jar"
+        ).read_bytes() == b"version two"
+        install(receipt_order, second)
+        assert not receipt_order.pending_upgrade.exists()
+        assert (receipt_order.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
 
         duplicate = root / "duplicate.zip"
         with zipfile.ZipFile(duplicate, "w") as archive:

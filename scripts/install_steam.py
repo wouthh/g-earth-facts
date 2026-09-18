@@ -30,6 +30,7 @@ ZIP_NAME = f"G-Earth-Facts-{VERSION}-extension.zip"
 MAX_PACKAGE_BYTES = 64 * 1024 * 1024
 CERT_NAMES = ("gearth-nitro-v2.crt", "gearth-nitro-v2.key")
 FIRST_INSTALL_TOKEN = ".g-earth-facts-install-token"
+RESTORE_MARKER = ".g-earth-facts-restore.json"
 BACKUP_NAME_PATTERN = re.compile(
     rf"^{re.escape(PLUGIN_ID)}-\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?-(?P<timestamp>\d{{8}}T\d{{6}}\.\d{{6}}Z)$"
 )
@@ -366,20 +367,76 @@ def _remove_owned_plugin(path: Path) -> None:
     shutil.rmtree(path)
 
 
+def _validate_restore_marker(marker: Path, backup: Path, expected_token: str) -> None:
+    if marker.is_symlink() or not marker.is_file():
+        raise InstallError(f"Steam restore staging marker is invalid: {marker}")
+    try:
+        state = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise InstallError(f"Steam restore staging marker is invalid: {marker}")
+    if (
+        not isinstance(state, dict)
+        or state.get("schema") != 1
+        or state.get("operation") != "restore"
+        or state.get("backup") != backup.name
+        or state.get("token") != expected_token
+    ):
+        raise InstallError(f"Steam restore staging marker is invalid: {marker}")
+
+
+def _clear_restore_marker(plugin: Path, backup: Path, expected_token: str) -> None:
+    marker = plugin / RESTORE_MARKER
+    if not _lexists(marker):
+        return
+    _validate_restore_marker(marker, backup, expected_token)
+    marker.unlink()
+
+
 def _restore_plugin_backup(
     layout: Layout, backup: Path, expected_token: str | None = None
 ) -> None:
     if not _known_plugin(backup):
         raise InstallError(f"Steam plugin backup is unavailable: {backup}")
     restore = layout.profile_extensions / f".{PLUGIN_ID}.restore"
-    if _lexists(restore):
-        raise InstallError(f"Steam restore staging path is occupied: {restore}")
     restore_created = False
     active_removed = False
+
+    def restore_marker(root: Path = restore) -> Path:
+        return root / RESTORE_MARKER
+
+    def validate_restore_marker(root: Path = restore) -> None:
+        marker = restore_marker(root)
+        _validate_restore_marker(marker, backup, expected_token)
+
+    def write_restore_marker() -> None:
+        if expected_token is None:
+            return
+        _atomic_json(
+            restore_marker(),
+            {
+                "schema": 1,
+                "operation": "restore",
+                "backup": backup.name,
+                "token": expected_token,
+            },
+        )
+
     try:
-        restore.mkdir(mode=0o700)
-        restore_created = True
-        shutil.copytree(backup, restore, symlinks=True, dirs_exist_ok=True)
+        if _lexists(restore):
+            if expected_token is None:
+                raise InstallError(f"Steam restore staging path is occupied: {restore}")
+            validate_restore_marker()
+            if not _known_plugin(restore):
+                _remove_owned_plugin(restore)
+                restore.mkdir(mode=0o700)
+                restore_created = True
+                write_restore_marker()
+                shutil.copytree(backup, restore, symlinks=True, dirs_exist_ok=True)
+        else:
+            restore.mkdir(mode=0o700)
+            restore_created = True
+            write_restore_marker()
+            shutil.copytree(backup, restore, symlinks=True, dirs_exist_ok=True)
         if not _known_plugin(restore):
             raise InstallError(f"Steam restore staging is incomplete: {restore}")
         if _lexists(layout.plugin):
@@ -396,6 +453,11 @@ def _restore_plugin_backup(
             _remove_owned_plugin(layout.plugin)
             active_removed = True
         os.replace(restore, layout.plugin)
+        if expected_token is not None:
+            marker = layout.plugin / RESTORE_MARKER
+            if _lexists(marker):
+                validate_restore_marker(layout.plugin)
+                marker.unlink()
     except Exception:
         if active_removed and not _lexists(layout.plugin) and _known_plugin(restore):
             os.replace(restore, layout.plugin)
@@ -468,8 +530,10 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
     backup_token = _read_transaction_token(backup)
     if backup_token is None:
         raise InstallError(f"Pending upgrade backup has no transaction token: {backup}")
+    token = state.get("token")
+    if token is not None and not _valid_transaction_token(token):
+        raise InstallError(f"Pending upgrade has an invalid transaction binding: {pending}")
     if _lexists(layout.plugin):
-        token = state.get("token")
         if not _valid_transaction_token(token):
             raise InstallError(f"Pending upgrade has no transaction binding: {pending}")
         active_token = _read_transaction_token(layout.plugin)
@@ -477,6 +541,8 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
             raise InstallError(f"Steam plugin is unfamiliar while recovering: {layout.plugin}")
         if _known_plugin(layout.plugin):
             # The replacement reached its destination before the marker was cleared.
+            if active_token == backup_token:
+                _clear_restore_marker(layout.plugin, backup, token)
             pending.unlink()
             return backup
         if layout.plugin.is_symlink() or not layout.plugin.is_dir():
@@ -488,7 +554,7 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
 
     if not layout.profile_extensions.is_dir() or layout.profile_extensions.is_symlink():
         raise InstallError(f"Steam Extensions directory is unavailable: {layout.profile_extensions}")
-    _restore_plugin_backup(layout, backup)
+    _restore_plugin_backup(layout, backup, token if isinstance(token, str) else None)
     pending.unlink()
     return backup
 
@@ -525,6 +591,7 @@ def _read_pending_rollback(layout: Layout) -> dict[str, str | None] | None:
             or not name
             or Path(name).name != name
             or Path(name).is_absolute()
+            or BACKUP_NAME_PATTERN.fullmatch(name) is None
         ):
             raise InstallError(f"Pending rollback marker has an unsafe {label}: {pending}")
         return layout.backup_root / name
@@ -554,6 +621,21 @@ def _read_pending_rollback(layout: Layout) -> dict[str, str | None] | None:
         "target": target.name,
         "current": current.name if current is not None else None,
     }
+
+
+def _finalize_recovered_rollback(
+    layout: Layout, recovered: dict[str, str | None], managed_links: list[str]
+) -> None:
+    _atomic_json(
+        layout.receipt,
+        {
+            "schema": 1,
+            "plugin": layout.plugin.name,
+            "managedLinks": managed_links,
+            "rollback": recovered["target"],
+        },
+    )
+    layout.pending_rollback.unlink(missing_ok=True)
 
 
 def _preflight(
@@ -762,7 +844,10 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     _ensure_backup_root_safe(layout)
     _validated_backups(layout)
     _ensure_receipt_safe(layout)
-    _read_pending_rollback(layout)
+    managed_links = sorted(_read_receipt_managed_links(layout.profile))
+    recovered_rollback = _read_pending_rollback(layout)
+    if recovered_rollback is not None:
+        _finalize_recovered_rollback(layout, recovered_rollback, managed_links)
     recovered_backup = _read_pending_upgrade(layout)
     _require_receipt_for_existing_plugin(layout)
     shared_children, cert_links, stale_links, old_plugin = _preflight(layout)
@@ -868,7 +953,6 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
                 raise InstallError(
                     "Steam installation failed; pending recovery marker was retained"
                 ) from recovery
-            layout.pending_upgrade.unlink(missing_ok=True)
         elif backup_created and backup is not None and _lexists(backup):
             # A failed copy can leave a partial timestamped backup even though no
             # transaction marker was published.  Remove that owned destination so
@@ -880,6 +964,8 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
             layout.receipt.unlink(missing_ok=True)
         else:
             _atomic_bytes(layout.receipt, previous_receipt)
+        if pending_written and backup is not None:
+            layout.pending_upgrade.unlink(missing_ok=True)
         if isinstance(exc, InstallError):
             raise
         raise InstallError("Steam installation rolled back after an unexpected failure") from exc
@@ -906,16 +992,7 @@ def rollback(layout: Layout) -> dict[str, object]:
     _require_receipt_for_existing_plugin(layout)
     recovered = _read_pending_rollback(layout)
     if recovered is not None:
-        _atomic_json(
-            layout.receipt,
-            {
-                "schema": 1,
-                "plugin": layout.plugin.name,
-                "managedLinks": managed_links,
-                "rollback": recovered["target"],
-            },
-        )
-        layout.pending_rollback.unlink(missing_ok=True)
+        _finalize_recovered_rollback(layout, recovered, managed_links)
         return {"restored": str(layout.plugin), "previous": recovered["current"]}
     _require_directory(layout.profile_extensions, "Steam Extensions directory")
     if _lexists(layout.plugin) and not _known_plugin(layout.plugin):
