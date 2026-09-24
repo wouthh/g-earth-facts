@@ -426,17 +426,12 @@ def _restore_plugin_backup(
             if expected_token is None:
                 raise InstallError(f"Steam restore staging path is occupied: {restore}")
             validate_restore_marker()
-            if not _known_plugin(restore):
-                _remove_owned_plugin(restore)
-                restore.mkdir(mode=0o700)
-                restore_created = True
-                write_restore_marker()
-                shutil.copytree(backup, restore, symlinks=True, dirs_exist_ok=True)
-        else:
-            restore.mkdir(mode=0o700)
-            restore_created = True
-            write_restore_marker()
-            shutil.copytree(backup, restore, symlinks=True, dirs_exist_ok=True)
+            # The marker proves ownership, not that an interrupted copy completed.
+            _remove_owned_plugin(restore)
+        restore.mkdir(mode=0o700)
+        restore_created = True
+        write_restore_marker()
+        shutil.copytree(backup, restore, symlinks=True, dirs_exist_ok=True)
         if not _known_plugin(restore):
             raise InstallError(f"Steam restore staging is incomplete: {restore}")
         if _lexists(layout.plugin):
@@ -464,6 +459,42 @@ def _restore_plugin_backup(
         if restore_created and _lexists(restore):
             _remove_owned_plugin(restore)
         raise
+
+
+def _saved_upgrade_receipt(state: dict[str, object], pending: Path) -> bytes | None:
+    """Validate and return the prior receipt carried by a new upgrade marker."""
+    saved = state.get("previousReceipt")
+    if saved is None:
+        return None
+    if not isinstance(saved, str):
+        raise InstallError(f"Pending upgrade receipt is invalid: {pending}")
+    try:
+        receipt = json.loads(saved)
+        encoded = saved.encode("utf-8")
+    except (UnicodeDecodeError, json.JSONDecodeError, UnicodeEncodeError):
+        raise InstallError(f"Pending upgrade receipt is invalid: {pending}")
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("schema") != 1
+        or not _valid_plugin_name(receipt.get("plugin"))
+    ):
+        raise InstallError(f"Pending upgrade receipt is invalid: {pending}")
+    managed_links = receipt.get("managedLinks")
+    if managed_links is not None and (
+        not isinstance(managed_links, list)
+        or any(
+            not _valid_entry_name(name) or _valid_plugin_name(name)
+            for name in managed_links
+        )
+    ):
+        raise InstallError(f"Pending upgrade receipt is invalid: {pending}")
+    certificates = receipt.get("certificates")
+    if certificates is not None and (
+        not isinstance(certificates, list)
+        or any(not _valid_entry_name(name) for name in certificates)
+    ):
+        raise InstallError(f"Pending upgrade receipt is invalid: {pending}")
+    return encoded
 
 
 def _read_pending_upgrade(layout: Layout) -> Path | None:
@@ -516,6 +547,7 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
         return None
     if operation != "upgrade":
         raise InstallError(f"Pending upgrade marker is invalid: {pending}")
+    previous_receipt = _saved_upgrade_receipt(state, pending)
     backup_name = state.get("backup")
     if (
         not isinstance(backup_name, str)
@@ -542,6 +574,8 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
         if _known_plugin(layout.plugin):
             # The replacement reached its destination before the marker was cleared.
             if active_token == backup_token:
+                if previous_receipt is not None:
+                    _atomic_bytes(layout.receipt, previous_receipt)
                 _clear_restore_marker(layout.plugin, backup, token)
             pending.unlink()
             return backup
@@ -555,6 +589,8 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
     if not layout.profile_extensions.is_dir() or layout.profile_extensions.is_symlink():
         raise InstallError(f"Steam Extensions directory is unavailable: {layout.profile_extensions}")
     _restore_plugin_backup(layout, backup, token if isinstance(token, str) else None)
+    if previous_receipt is not None:
+        _atomic_bytes(layout.receipt, previous_receipt)
     pending.unlink()
     return backup
 
@@ -640,6 +676,8 @@ def _finalize_recovered_rollback(
 
 def _preflight(
     layout: Layout,
+    *,
+    validate_plugin: bool = True,
 ) -> tuple[list[Path], list[tuple[Path, Path]], list[tuple[Path, Path]], Path | None]:
     _require_directory(layout.shared_app, "shared G-Earth directory")
     _require_directory(layout.shared_extensions, "shared Extensions directory")
@@ -649,7 +687,8 @@ def _preflight(
     _require_directory(layout.profile_extensions, "Steam Extensions directory", allow_missing=True)
     _ensure_backup_root_safe(layout)
     _ensure_receipt_safe(layout)
-    _require_receipt_for_existing_plugin(layout)
+    if validate_plugin:
+        _require_receipt_for_existing_plugin(layout)
 
     shared_children = sorted(layout.shared_extensions.iterdir(), key=lambda path: path.name)
     shared_names = {child.name for child in shared_children}
@@ -684,7 +723,7 @@ def _preflight(
             raise InstallError(f"Steam extension-link collision: {destination}")
 
     old_plugin: Path | None = None
-    if _lexists(layout.plugin):
+    if validate_plugin and _lexists(layout.plugin):
         if not _known_plugin(layout.plugin):
             raise InstallError(f"Steam plugin name is occupied by an unfamiliar entry: {layout.plugin}")
         old_plugin = layout.plugin
@@ -845,6 +884,8 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     _validated_backups(layout)
     _ensure_receipt_safe(layout)
     managed_links = sorted(_read_receipt_managed_links(layout.profile))
+    # Refuse collisions in the live view before recovery can move any backup.
+    _preflight(layout, validate_plugin=False)
     recovered_rollback = _read_pending_rollback(layout)
     if recovered_rollback is not None:
         _finalize_recovered_rollback(layout, recovered_rollback, managed_links)
@@ -885,29 +926,29 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
                 # Recovery already retained the pre-upgrade plugin. Reuse that
                 # backup so a retry cannot make rollback restore the replacement.
                 backup = recovered_backup
-                _atomic_json(
-                    layout.pending_upgrade,
-                    {
-                        "schema": 1,
-                        "operation": "upgrade",
-                        "backup": backup.name,
-                        "token": transaction_token,
-                    },
-                )
+                marker = {
+                    "schema": 1,
+                    "operation": "upgrade",
+                    "backup": backup.name,
+                    "token": transaction_token,
+                }
+                if previous_receipt is not None:
+                    marker["previousReceipt"] = previous_receipt.decode("utf-8")
+                _atomic_json(layout.pending_upgrade, marker)
                 pending_written = True
             else:
                 backup = _create_backup(layout, old_plugin)
                 backup_created = True
+                marker = {
+                    "schema": 1,
+                    "operation": "upgrade",
+                    "backup": backup.name,
+                    "token": transaction_token,
+                }
+                if previous_receipt is not None:
+                    marker["previousReceipt"] = previous_receipt.decode("utf-8")
+                _atomic_json(layout.pending_upgrade, marker)
                 pending_written = True
-                _atomic_json(
-                    layout.pending_upgrade,
-                    {
-                        "schema": 1,
-                        "operation": "upgrade",
-                        "backup": backup.name,
-                        "token": transaction_token,
-                    },
-                )
             shutil.rmtree(old_plugin)
         for destination, source in stale_links:
             if not _lexists(destination):

@@ -343,6 +343,48 @@ def main() -> None:
         assert not (restore_resume.plugin / RESTORE_MARKER).exists()
         assert not restore_resume_stage.exists()
 
+        partial_restore_root = root / "partial-restore-stage"
+        partial_restore = make_layout(partial_restore_root)
+        install(partial_restore, first)
+        install(partial_restore, second)
+        partial_restore_backup = next(path for path in partial_restore.backup_root.iterdir())
+        shutil.rmtree(partial_restore.plugin)
+        partial_restore_stage = partial_restore.profile_extensions / ".G-Earth-Facts.restore"
+        partial_restore_stage.mkdir()
+        (partial_restore_stage / "command.txt").write_text("[]", encoding="utf-8")
+        partial_jar = partial_restore_stage / "extension/G-Earth-Facts.jar"
+        partial_jar.parent.mkdir()
+        partial_jar.write_bytes(b"partial jar")
+        partial_restore_token = "e" * 32
+        (partial_restore_stage / RESTORE_MARKER).write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "restore",
+                    "backup": partial_restore_backup.name,
+                    "token": partial_restore_token,
+                }
+            ),
+            encoding="utf-8",
+        )
+        partial_restore.pending_upgrade.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "upgrade",
+                    "backup": partial_restore_backup.name,
+                    "token": partial_restore_token,
+                }
+            ),
+            encoding="utf-8",
+        )
+        _read_pending_upgrade(partial_restore)
+        assert (
+            partial_restore.plugin / "extension/G-Earth-Facts.jar"
+        ).read_bytes() == b"version one"
+        assert not partial_restore_stage.exists()
+        assert not partial_restore.pending_upgrade.exists()
+
         recovery_collision_root = root / "recovery-destination-collision"
         recovery_collision = make_layout(recovery_collision_root)
         install(recovery_collision, first)
@@ -763,6 +805,29 @@ def main() -> None:
         assert copy_destinations
         assert copy_destinations[0].parent == copy_failure.profile.parent
 
+        marker_failure_root = root / "upgrade-marker-failure"
+        marker_failure = make_layout(marker_failure_root)
+        install(marker_failure, first)
+        marker_failure_receipt = marker_failure.receipt.read_bytes()
+        real_atomic_json = install_steam._atomic_json
+
+        def fail_upgrade_marker(path, value):
+            if path == marker_failure.pending_upgrade:
+                raise OSError("synthetic pending upgrade marker failure")
+            return real_atomic_json(path, value)
+
+        with patch("install_steam._atomic_json", side_effect=fail_upgrade_marker):
+            try:
+                install(marker_failure, second)
+            except InstallError:
+                pass
+            else:
+                raise AssertionError("installer accepted a failed upgrade marker write")
+        assert (marker_failure.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+        assert marker_failure.receipt.read_bytes() == marker_failure_receipt
+        assert not marker_failure.pending_upgrade.exists()
+        assert not list(marker_failure.backup_root.iterdir())
+
         backup_name_collision_root = root / "backup-name-collision"
         backup_name_collision = make_layout(backup_name_collision_root)
         install(backup_name_collision, first)
@@ -990,6 +1055,44 @@ def main() -> None:
         assert not rollback_marker_collision.plugin.exists()
         assert rollback_marker_collision.pending_rollback.exists()
 
+        recovery_link_collision_root = root / "recovery-link-collision"
+        recovery_link_collision = make_layout(recovery_link_collision_root)
+        install(recovery_link_collision, first)
+        install(recovery_link_collision, second)
+        recovery_target = next(path for path in recovery_link_collision.backup_root.iterdir())
+        recovery_current = (
+            recovery_link_collision.backup_root
+            / "G-Earth-Facts-0.1.0-20990101T010400.000000Z"
+        )
+        os.replace(recovery_link_collision.plugin, recovery_current)
+        recovery_link_collision.pending_rollback.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "rollback",
+                    "target": recovery_target.name,
+                    "current": recovery_current.name,
+                }
+            ),
+            encoding="utf-8",
+        )
+        collision_path = recovery_link_collision.profile_extensions / "SharedOne"
+        collision_path.unlink()
+        collision_path.write_text("preserve", encoding="utf-8")
+        collision_receipt = recovery_link_collision.receipt.read_bytes()
+        try:
+            install(recovery_link_collision, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer recovered rollback before checking link collisions")
+        assert not recovery_link_collision.plugin.exists()
+        assert recovery_target.is_dir()
+        assert recovery_current.is_dir()
+        assert recovery_link_collision.pending_rollback.exists()
+        assert collision_path.read_text(encoding="utf-8") == "preserve"
+        assert recovery_link_collision.receipt.read_bytes() == collision_receipt
+
         atomic_receipt_root = root / "atomic-receipt-recovery"
         atomic_receipt = make_layout(atomic_receipt_root)
         install(atomic_receipt, first)
@@ -1027,6 +1130,44 @@ def main() -> None:
             else:
                 raise AssertionError("install hid a synthetic pending marker failure")
         assert atomic_receipt.receipt.read_bytes() == previous_receipt
+
+        saved_receipt_root = root / "saved-receipt-recovery"
+        saved_receipt = make_layout(saved_receipt_root)
+        install(saved_receipt, first)
+        old_receipt = saved_receipt.receipt.read_bytes()
+        (saved_receipt.shared_extensions / "SharedOne").rmdir()
+        pending_unlinks = 0
+        real_unlink = Path.unlink
+        real_atomic_bytes = install_steam._atomic_bytes
+
+        def fail_pending_cleanup(path, *args, **kwargs):
+            nonlocal pending_unlinks
+            if path == saved_receipt.pending_upgrade:
+                pending_unlinks += 1
+                if pending_unlinks == 1:
+                    raise OSError("synthetic pending marker cleanup failure")
+            return real_unlink(path, *args, **kwargs)
+
+        def fail_saved_receipt_restore(path, value):
+            if path == saved_receipt.receipt:
+                raise OSError("synthetic saved receipt restore failure")
+            return real_atomic_bytes(path, value)
+
+        with patch.object(
+            Path, "unlink", autospec=True, side_effect=fail_pending_cleanup
+        ), patch("install_steam._atomic_bytes", side_effect=fail_saved_receipt_restore):
+            try:
+                install(saved_receipt, second)
+            except OSError:
+                pass
+            else:
+                raise AssertionError("installer hid a synthetic receipt restore failure")
+        assert saved_receipt.pending_upgrade.exists()
+        assert saved_receipt.receipt.read_bytes() != old_receipt
+        assert (saved_receipt.profile_extensions / "SharedOne").is_symlink()
+        _read_pending_upgrade(saved_receipt)
+        assert saved_receipt.receipt.read_bytes() == old_receipt
+        assert not saved_receipt.pending_upgrade.exists()
 
         receipt_order_root = root / "receipt-order"
         receipt_order = make_layout(receipt_order_root)
