@@ -340,6 +340,7 @@ def _known_plugin(path: Path) -> bool:
         and jar.is_file()
         and not jar.is_symlink()
         and jar.stat().st_size > 0
+        and _read_transaction_token(path) is not None
     )
 
 
@@ -392,13 +393,12 @@ def _clear_restore_marker(plugin: Path, backup: Path, expected_token: str) -> No
     marker.unlink()
 
 
-def _restore_plugin_backup(
-    layout: Layout, backup: Path, expected_token: str | None = None
-) -> None:
+def _restore_plugin_backup(layout: Layout, backup: Path, expected_token: str) -> None:
     if not _known_plugin(backup):
         raise InstallError(f"Steam plugin backup is unavailable: {backup}")
+    if not _valid_transaction_token(expected_token):
+        raise InstallError(f"Steam plugin restore has no transaction binding: {backup}")
     restore = layout.profile_extensions / f".{PLUGIN_ID}.restore"
-    restore_created = False
     active_removed = False
 
     def restore_marker(root: Path = restore) -> Path:
@@ -408,11 +408,9 @@ def _restore_plugin_backup(
         marker = restore_marker(root)
         _validate_restore_marker(marker, backup, expected_token)
 
-    def write_restore_marker() -> None:
-        if expected_token is None:
-            return
+    def write_restore_marker(root: Path = restore) -> None:
         _atomic_json(
-            restore_marker(),
+            restore_marker(root),
             {
                 "schema": 1,
                 "operation": "restore",
@@ -423,14 +421,30 @@ def _restore_plugin_backup(
 
     try:
         if _lexists(restore):
-            if expected_token is None:
-                raise InstallError(f"Steam restore staging path is occupied: {restore}")
             validate_restore_marker()
-            # The marker proves ownership, not that an interrupted copy completed.
-            _remove_owned_plugin(restore)
-        restore.mkdir(mode=0o700)
-        restore_created = True
-        write_restore_marker()
+            # Keep ownership durable while clearing an interrupted partial copy.
+            for child in restore.iterdir():
+                if child.name == RESTORE_MARKER:
+                    continue
+                if child.is_symlink() or not child.is_dir():
+                    child.unlink()
+                else:
+                    shutil.rmtree(child)
+        else:
+            staging = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{PLUGIN_ID}.restore-stage-", dir=restore.parent
+                )
+            )
+            try:
+                write_restore_marker(staging)
+                if _lexists(restore):
+                    raise InstallError(f"Steam restore staging path is occupied: {restore}")
+                os.rename(staging, restore)
+            except Exception:
+                if _lexists(staging):
+                    shutil.rmtree(staging, ignore_errors=True)
+                raise
         shutil.copytree(backup, restore, symlinks=True, dirs_exist_ok=True)
         if not _known_plugin(restore):
             raise InstallError(f"Steam restore staging is incomplete: {restore}")
@@ -456,12 +470,12 @@ def _restore_plugin_backup(
     except Exception:
         if active_removed and not _lexists(layout.plugin) and _known_plugin(restore):
             os.replace(restore, layout.plugin)
-        if restore_created and _lexists(restore):
-            _remove_owned_plugin(restore)
         raise
 
 
-def _saved_upgrade_receipt(state: dict[str, object], pending: Path) -> bytes | None:
+def _saved_upgrade_receipt(
+    state: dict[str, object], pending: Path, expected_plugin: str
+) -> bytes | None:
     """Validate and return the prior receipt carried by a new upgrade marker."""
     saved = state.get("previousReceipt")
     if saved is None:
@@ -477,6 +491,7 @@ def _saved_upgrade_receipt(state: dict[str, object], pending: Path) -> bytes | N
         not isinstance(receipt, dict)
         or receipt.get("schema") != 1
         or not _valid_plugin_name(receipt.get("plugin"))
+        or receipt.get("plugin") != expected_plugin
     ):
         raise InstallError(f"Pending upgrade receipt is invalid: {pending}")
     managed_links = receipt.get("managedLinks")
@@ -495,6 +510,28 @@ def _saved_upgrade_receipt(state: dict[str, object], pending: Path) -> bytes | N
     ):
         raise InstallError(f"Pending upgrade receipt is invalid: {pending}")
     return encoded
+
+
+def _pending_upgrade_managed_links(layout: Layout) -> set[str]:
+    """Include prior-receipt links while checking collisions before recovery."""
+    pending = layout.pending_upgrade
+    if not _lexists(pending):
+        return set()
+    if pending.is_symlink() or not pending.is_file():
+        raise InstallError(f"Pending upgrade marker is not a regular file: {pending}")
+    try:
+        state = json.loads(pending.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise InstallError(f"Pending upgrade marker is invalid: {pending}")
+    if not isinstance(state, dict) or state.get("schema") != 1:
+        raise InstallError(f"Pending upgrade marker is invalid: {pending}")
+    if state.get("operation", "upgrade") != "upgrade":
+        return set()
+    previous_receipt = _saved_upgrade_receipt(state, pending, layout.plugin.name)
+    if previous_receipt is None:
+        return set()
+    receipt = json.loads(previous_receipt)
+    return set(receipt.get("managedLinks") or [])
 
 
 def _read_pending_upgrade(layout: Layout) -> Path | None:
@@ -547,7 +584,7 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
         return None
     if operation != "upgrade":
         raise InstallError(f"Pending upgrade marker is invalid: {pending}")
-    previous_receipt = _saved_upgrade_receipt(state, pending)
+    previous_receipt = _saved_upgrade_receipt(state, pending, layout.plugin.name)
     backup_name = state.get("backup")
     if (
         not isinstance(backup_name, str)
@@ -565,6 +602,7 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
     token = state.get("token")
     if token is not None and not _valid_transaction_token(token):
         raise InstallError(f"Pending upgrade has an invalid transaction binding: {pending}")
+    restore_token = token if isinstance(token, str) else backup_token
     if _lexists(layout.plugin):
         if not _valid_transaction_token(token):
             raise InstallError(f"Pending upgrade has no transaction binding: {pending}")
@@ -576,7 +614,7 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
             if active_token == backup_token:
                 if previous_receipt is not None:
                     _atomic_bytes(layout.receipt, previous_receipt)
-                _clear_restore_marker(layout.plugin, backup, token)
+                _clear_restore_marker(layout.plugin, backup, restore_token)
             pending.unlink()
             return backup
         if layout.plugin.is_symlink() or not layout.plugin.is_dir():
@@ -588,7 +626,7 @@ def _read_pending_upgrade(layout: Layout) -> Path | None:
 
     if not layout.profile_extensions.is_dir() or layout.profile_extensions.is_symlink():
         raise InstallError(f"Steam Extensions directory is unavailable: {layout.profile_extensions}")
-    _restore_plugin_backup(layout, backup, token if isinstance(token, str) else None)
+    _restore_plugin_backup(layout, backup, restore_token)
     if previous_receipt is not None:
         _atomic_bytes(layout.receipt, previous_receipt)
     pending.unlink()
@@ -636,20 +674,67 @@ def _read_pending_rollback(layout: Layout) -> dict[str, str | None] | None:
     current = backup_path(current_name, "current")
     if target is None:
         raise InstallError(f"Pending rollback marker has no target: {pending}")
-    if _lexists(layout.plugin):
+
+    has_target_token = "targetToken" in state
+    has_active_token = "activeToken" in state
+    if has_target_token != has_active_token:
+        raise InstallError(f"Pending rollback marker has an incomplete transaction binding: {pending}")
+    bound = has_target_token and has_active_token
+    target_token = state.get("targetToken") if bound else None
+    active_token = state.get("activeToken") if bound else None
+    if bound and (
+        not _valid_transaction_token(target_token)
+        or (active_token is not None and not _valid_transaction_token(active_token))
+        or ((current is None) != (active_token is None))
+    ):
+        raise InstallError(f"Pending rollback marker has an invalid transaction binding: {pending}")
+    if not bound and _lexists(layout.plugin):
+        raise InstallError(f"Pending rollback marker has no transaction binding: {pending}")
+
+    target_exists = _lexists(target)
+    if target_exists:
+        if not _known_plugin(target):
+            raise InstallError(f"Pending rollback target is occupied or unavailable: {target}")
+        if bound and _read_transaction_token(target) != target_token:
+            raise InstallError(f"Pending rollback target does not match its transaction: {target}")
+    current_exists = current is not None and _lexists(current)
+    if current_exists:
+        if not _known_plugin(current):
+            raise InstallError(f"Pending rollback current backup is unavailable: {current}")
+        if bound and _read_transaction_token(current) != active_token:
+            raise InstallError(f"Pending rollback current backup does not match its transaction: {current}")
+
+    if bound and _lexists(layout.plugin):
         if not _known_plugin(layout.plugin):
             raise InstallError(f"Steam plugin is unfamiliar while recovering: {layout.plugin}")
-        completed = not _known_plugin(target) and current is not None and _known_plugin(current)
+        plugin_token = _read_transaction_token(layout.plugin)
+        if plugin_token == active_token and target_exists and not current_exists:
+            # The marker was published, but the active plugin was not moved yet.
+            pending.unlink()
+            return None
+        completed = (
+            plugin_token == target_token
+            and not target_exists
+            and ((current is None and active_token is None) or current_exists)
+        )
         if completed:
             return {
                 "target": target.name,
                 "current": current.name if current is not None else None,
             }
-        pending.unlink()
-        return None
+        raise InstallError(f"Steam plugin does not match its pending rollback: {layout.plugin}")
+
     if not layout.profile_extensions.is_dir() or layout.profile_extensions.is_symlink():
         raise InstallError(f"Steam Extensions directory is unavailable: {layout.profile_extensions}")
-    source = target if _known_plugin(target) else current
+    if bound:
+        if target_exists and (active_token is None or current_exists):
+            os.replace(target, layout.plugin)
+            return {
+                "target": target.name,
+                "current": current.name if current is not None else None,
+            }
+        raise InstallError(f"Pending rollback backups are unavailable: {pending}")
+    source = target if target_exists else current
     if source is None or not _known_plugin(source):
         raise InstallError(f"Pending rollback backups are unavailable: {pending}")
     os.replace(source, layout.plugin)
@@ -678,6 +763,7 @@ def _preflight(
     layout: Layout,
     *,
     validate_plugin: bool = True,
+    additional_managed_links: set[str] | None = None,
 ) -> tuple[list[Path], list[tuple[Path, Path]], list[tuple[Path, Path]], Path | None]:
     _require_directory(layout.shared_app, "shared G-Earth directory")
     _require_directory(layout.shared_extensions, "shared Extensions directory")
@@ -693,6 +779,8 @@ def _preflight(
     shared_children = sorted(layout.shared_extensions.iterdir(), key=lambda path: path.name)
     shared_names = {child.name for child in shared_children}
     managed_links = _read_receipt_managed_links(layout.profile)
+    if additional_managed_links:
+        managed_links.update(additional_managed_links)
     _validate_managed_links(layout, managed_links)
     stale_links: list[tuple[Path, Path]] = []
     for name in sorted(managed_links - shared_names):
@@ -884,8 +972,14 @@ def install(layout: Layout, zip_path: Path) -> dict[str, object]:
     _validated_backups(layout)
     _ensure_receipt_safe(layout)
     managed_links = sorted(_read_receipt_managed_links(layout.profile))
-    # Refuse collisions in the live view before recovery can move any backup.
-    _preflight(layout, validate_plugin=False)
+    # A pending upgrade's prior receipt can still own stale links omitted by the
+    # replacement receipt, so validate against both receipts before recovery.
+    pending_managed_links = _pending_upgrade_managed_links(layout)
+    _preflight(
+        layout,
+        validate_plugin=False,
+        additional_managed_links=pending_managed_links,
+    )
     recovered_rollback = _read_pending_rollback(layout)
     if recovered_rollback is not None:
         _finalize_recovered_rollback(layout, recovered_rollback, managed_links)
@@ -1042,10 +1136,17 @@ def rollback(layout: Layout) -> dict[str, object]:
     if not backups:
         raise InstallError("No retained G-Earth Facts backup is available")
     current: Path | None = None
+    active_token: str | None = None
     pending_written = False
     target = backups[-1]
+    target_token = _read_transaction_token(target)
+    if target_token is None:
+        raise InstallError(f"Steam rollback target has no transaction token: {target}")
     try:
         if _lexists(layout.plugin):
+            active_token = _read_transaction_token(layout.plugin)
+            if active_token is None:
+                raise InstallError(f"Current Steam plugin has no transaction token: {layout.plugin}")
             current = _backup_name(layout.backup_root)
             _atomic_json(
                 layout.pending_rollback,
@@ -1054,6 +1155,8 @@ def rollback(layout: Layout) -> dict[str, object]:
                     "operation": "rollback",
                     "target": target.name,
                     "current": current.name,
+                    "targetToken": target_token,
+                    "activeToken": active_token,
                 },
             )
             pending_written = True
@@ -1075,7 +1178,6 @@ def rollback(layout: Layout) -> dict[str, object]:
             source = target if _known_plugin(target) else current
             if source is not None and _known_plugin(source):
                 os.replace(source, layout.plugin)
-                layout.pending_rollback.unlink(missing_ok=True)
         if isinstance(exc, InstallError):
             raise
         raise InstallError("Rollback interrupted; recovery state was retained") from exc

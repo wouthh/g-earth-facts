@@ -61,6 +61,29 @@ def make_layout(root: Path) -> Layout:
     return Layout(profile, shared_extensions, shared_app)
 
 
+def rollback_marker(
+    target: Path,
+    current: Path | None,
+    *,
+    target_binding: str | None = None,
+    active_binding: str | None = None,
+) -> dict[str, object]:
+    if target_binding is None:
+        target_binding = install_steam._read_transaction_token(target)
+    if current is not None and active_binding is None:
+        active_binding = install_steam._read_transaction_token(current)
+    if target_binding is None or (current is not None and active_binding is None):
+        raise AssertionError("rollback marker fixture needs transaction tokens")
+    return {
+        "schema": 1,
+        "operation": "rollback",
+        "target": target.name,
+        "current": current.name if current is not None else None,
+        "targetToken": target_binding,
+        "activeToken": active_binding,
+    }
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="g-earth-facts-installer-") as temporary:
         root = Path(temporary)
@@ -108,6 +131,23 @@ def main() -> None:
         shutil.rmtree(layout.shared_extensions / "SharedOne")
         install(layout, second)
         assert not (layout.profile_extensions / "SharedOne").exists()
+
+        tokenless_root = root / "tokenless-active-plugin"
+        tokenless = make_layout(tokenless_root)
+        install(tokenless, first)
+        install(tokenless, second)
+        tokenless_plugin = (tokenless.plugin / "extension/G-Earth-Facts.jar").read_bytes()
+        tokenless_backups = list(tokenless.backup_root.iterdir())
+        (tokenless.plugin / FIRST_INSTALL_TOKEN).unlink()
+        try:
+            install(tokenless, first)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("installer backed up a plugin without its transaction token")
+        assert (tokenless.plugin / "extension/G-Earth-Facts.jar").read_bytes() == tokenless_plugin
+        assert list(tokenless.backup_root.iterdir()) == tokenless_backups
+        assert not tokenless.pending_upgrade.exists()
 
         recover_root = root / "recover"
         recover = make_layout(recover_root)
@@ -378,6 +418,24 @@ def main() -> None:
             ),
             encoding="utf-8",
         )
+        real_copytree = shutil.copytree
+
+        def fail_restore_copy(source, destination, *args, **kwargs):
+            result = real_copytree(source, destination, *args, **kwargs)
+            if Path(destination) == partial_restore_stage:
+                raise OSError("synthetic restore-stage copy interruption")
+            return result
+
+        with patch("install_steam.shutil.copytree", side_effect=fail_restore_copy):
+            try:
+                _read_pending_upgrade(partial_restore)
+            except OSError:
+                pass
+            else:
+                raise AssertionError("restore recovery hid a synthetic copy interruption")
+        assert (partial_restore_stage / RESTORE_MARKER).is_file()
+        assert partial_restore.pending_upgrade.exists()
+        assert not partial_restore.plugin.exists()
         _read_pending_upgrade(partial_restore)
         assert (
             partial_restore.plugin / "extension/G-Earth-Facts.jar"
@@ -506,14 +564,7 @@ def main() -> None:
         )
         os.replace(rollback_layout.plugin, interrupted_current)
         rollback_layout.pending_rollback.write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "operation": "rollback",
-                    "target": rollback_target.name,
-                    "current": interrupted_current.name,
-                }
-            ),
+            json.dumps(rollback_marker(rollback_target, interrupted_current)),
             encoding="utf-8",
         )
         rollback(rollback_layout)
@@ -534,16 +585,22 @@ def main() -> None:
             install_after_rollback.backup_root
             / "G-Earth-Facts-0.1.0-20990101T010600.000000Z"
         )
+        install_after_rollback_target_token = install_steam._read_transaction_token(
+            install_after_rollback_target
+        )
+        install_after_rollback_active_token = install_steam._read_transaction_token(
+            install_after_rollback.plugin
+        )
         os.replace(install_after_rollback.plugin, install_after_rollback_current)
         os.replace(install_after_rollback_target, install_after_rollback.plugin)
         install_after_rollback.pending_rollback.write_text(
             json.dumps(
-                {
-                    "schema": 1,
-                    "operation": "rollback",
-                    "target": install_after_rollback_target.name,
-                    "current": install_after_rollback_current.name,
-                }
+                rollback_marker(
+                    install_after_rollback_target,
+                    install_after_rollback_current,
+                    target_binding=install_after_rollback_target_token,
+                    active_binding=install_after_rollback_active_token,
+                )
             ),
             encoding="utf-8",
         )
@@ -561,14 +618,7 @@ def main() -> None:
         receipt_current = receipt_recovery.backup_root / "G-Earth-Facts-0.1.0-20990101T010500.000000Z"
         os.replace(receipt_recovery.plugin, receipt_current)
         receipt_recovery.pending_rollback.write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "operation": "rollback",
-                    "target": receipt_target.name,
-                    "current": receipt_current.name,
-                }
-            ),
+            json.dumps(rollback_marker(receipt_target, receipt_current)),
             encoding="utf-8",
         )
         real_atomic_json = install_steam._atomic_json
@@ -591,6 +641,39 @@ def main() -> None:
         ).read_bytes() == b"version one"
         rollback(receipt_recovery)
         assert not receipt_recovery.pending_rollback.exists()
+
+        rollback_retry_root = root / "rollback-retry-after-move-failure"
+        rollback_retry = make_layout(rollback_retry_root)
+        install(rollback_retry, first)
+        install(rollback_retry, second)
+        retry_target = next(path for path in rollback_retry.backup_root.iterdir())
+        retry_target_token = install_steam._read_transaction_token(retry_target)
+        retry_active_token = install_steam._read_transaction_token(rollback_retry.plugin)
+        real_replace = os.replace
+        failed_target_moves = 0
+
+        def fail_target_move_once(source, destination):
+            nonlocal failed_target_moves
+            if Path(source) == retry_target and Path(destination) == rollback_retry.plugin:
+                failed_target_moves += 1
+                if failed_target_moves == 1:
+                    raise OSError("synthetic transient rollback target move failure")
+            return real_replace(source, destination)
+
+        with patch("install_steam.os.replace", side_effect=fail_target_move_once):
+            try:
+                rollback(rollback_retry)
+            except InstallError:
+                pass
+            else:
+                raise AssertionError("rollback hid a transient target move failure")
+        assert rollback_retry.pending_rollback.exists()
+        assert (rollback_retry.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+        rollback(rollback_retry)
+        assert not rollback_retry.pending_rollback.exists()
+        assert json.loads(rollback_retry.receipt.read_text(encoding="utf-8"))["rollback"] == (
+            retry_target.name
+        )
 
         link_collision_root = root / "rollback-link-collision"
         link_collision = make_layout(link_collision_root)
@@ -1055,6 +1138,84 @@ def main() -> None:
         assert not rollback_marker_collision.plugin.exists()
         assert rollback_marker_collision.pending_rollback.exists()
 
+        replaced_active_root = root / "rollback-replaced-active-binding"
+        replaced_active = make_layout(replaced_active_root)
+        install(replaced_active, first)
+        install(replaced_active, second)
+        replaced_target = next(path for path in replaced_active.backup_root.iterdir())
+        replaced_target_token = install_steam._read_transaction_token(replaced_target)
+        replaced_active_token = install_steam._read_transaction_token(replaced_active.plugin)
+        replaced_current = (
+            replaced_active.backup_root / "G-Earth-Facts-0.1.0-20990101T010700.000000Z"
+        )
+        replaced_active.pending_rollback.write_text(
+            json.dumps(
+                rollback_marker(
+                    replaced_target,
+                    replaced_current,
+                    target_binding=replaced_target_token,
+                    active_binding=replaced_active_token,
+                )
+            ),
+            encoding="utf-8",
+        )
+        unexpected_plugin = replaced_active.profile_extensions / ".replacement-plugin"
+        shutil.copytree(replaced_active.plugin, unexpected_plugin, symlinks=True)
+        (unexpected_plugin / FIRST_INSTALL_TOKEN).write_text("f" * 32 + "\n", encoding="ascii")
+        shutil.rmtree(replaced_active.plugin)
+        os.replace(unexpected_plugin, replaced_active.plugin)
+        unexpected_bytes = (
+            replaced_active.plugin / "extension/G-Earth-Facts.jar"
+        ).read_bytes()
+        try:
+            rollback(replaced_active)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback accepted a plugin outside its pending transaction")
+        assert replaced_active.pending_rollback.exists()
+        assert (replaced_active.plugin / "extension/G-Earth-Facts.jar").read_bytes() == unexpected_bytes
+        assert replaced_target.is_dir()
+        assert not replaced_current.exists()
+
+        target_collision_root = root / "rollback-completion-target-collision"
+        target_collision = make_layout(target_collision_root)
+        install(target_collision, first)
+        install(target_collision, second)
+        collided_target = next(path for path in target_collision.backup_root.iterdir())
+        collided_target_token = install_steam._read_transaction_token(collided_target)
+        collided_active_token = install_steam._read_transaction_token(target_collision.plugin)
+        collided_current = (
+            target_collision.backup_root / "G-Earth-Facts-0.1.0-20990101T010800.000000Z"
+        )
+        os.replace(target_collision.plugin, collided_current)
+        os.replace(collided_target, target_collision.plugin)
+        collided_target.mkdir()
+        (collided_target / "keep.txt").write_text("preserve", encoding="utf-8")
+        collision_receipt = target_collision.receipt.read_bytes()
+        target_collision.pending_rollback.write_text(
+            json.dumps(
+                rollback_marker(
+                    collided_target,
+                    collided_current,
+                    target_binding=collided_target_token,
+                    active_binding=collided_active_token,
+                )
+            ),
+            encoding="utf-8",
+        )
+        try:
+            rollback(target_collision)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback finalized an occupied completion target")
+        assert target_collision.pending_rollback.exists()
+        assert (collided_target / "keep.txt").read_text(encoding="utf-8") == "preserve"
+        assert (target_collision.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+        assert (collided_current / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
+        assert target_collision.receipt.read_bytes() == collision_receipt
+
         recovery_link_collision_root = root / "recovery-link-collision"
         recovery_link_collision = make_layout(recovery_link_collision_root)
         install(recovery_link_collision, first)
@@ -1066,14 +1227,7 @@ def main() -> None:
         )
         os.replace(recovery_link_collision.plugin, recovery_current)
         recovery_link_collision.pending_rollback.write_text(
-            json.dumps(
-                {
-                    "schema": 1,
-                    "operation": "rollback",
-                    "target": recovery_target.name,
-                    "current": recovery_current.name,
-                }
-            ),
+            json.dumps(rollback_marker(recovery_target, recovery_current)),
             encoding="utf-8",
         )
         collision_path = recovery_link_collision.profile_extensions / "SharedOne"
@@ -1165,9 +1319,48 @@ def main() -> None:
         assert saved_receipt.pending_upgrade.exists()
         assert saved_receipt.receipt.read_bytes() != old_receipt
         assert (saved_receipt.profile_extensions / "SharedOne").is_symlink()
-        _read_pending_upgrade(saved_receipt)
-        assert saved_receipt.receipt.read_bytes() == old_receipt
+        install(saved_receipt, second)
+        assert (saved_receipt.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
+        assert json.loads(saved_receipt.receipt.read_text(encoding="utf-8"))["managedLinks"] == [
+            "SharedTwo"
+        ]
         assert not saved_receipt.pending_upgrade.exists()
+        assert not (saved_receipt.profile_extensions / "SharedOne").exists()
+
+        wrong_receipt_root = root / "pending-upgrade-wrong-receipt-plugin"
+        wrong_receipt = make_layout(wrong_receipt_root)
+        install(wrong_receipt, first)
+        install(wrong_receipt, second)
+        wrong_receipt_backup = next(path for path in wrong_receipt.backup_root.iterdir())
+        wrong_receipt_token = install_steam._read_transaction_token(wrong_receipt.plugin)
+        wrong_receipt_before = wrong_receipt.receipt.read_bytes()
+        wrong_previous_receipt = json.dumps(
+            {"schema": 1, "plugin": "G-Earth-Facts-0.2.0", "managedLinks": ["SharedOne"]}
+        )
+        wrong_receipt.pending_upgrade.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operation": "upgrade",
+                    "backup": wrong_receipt_backup.name,
+                    "token": wrong_receipt_token,
+                    "previousReceipt": wrong_previous_receipt,
+                }
+            ),
+            encoding="utf-8",
+        )
+        wrong_plugin_bytes = (
+            wrong_receipt.plugin / "extension/G-Earth-Facts.jar"
+        ).read_bytes()
+        try:
+            _read_pending_upgrade(wrong_receipt)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("upgrade accepted a receipt for a different plugin folder")
+        assert wrong_receipt.pending_upgrade.exists()
+        assert wrong_receipt.receipt.read_bytes() == wrong_receipt_before
+        assert (wrong_receipt.plugin / "extension/G-Earth-Facts.jar").read_bytes() == wrong_plugin_bytes
 
         receipt_order_root = root / "receipt-order"
         receipt_order = make_layout(receipt_order_root)
