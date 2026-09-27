@@ -27,8 +27,9 @@ pending HTTP or multipart work.
 
 The API key and prefix are stored in the Steam prefix's private Local AppData
 settings. This project does not include a key, a settings export, or a
-non-Steam installation. See [installation and rollback](docs/INSTALLATION.md)
-for the profile layout and managed-link rules.
+non-Steam installation. See [configuration](docs/CONFIGURATION.md) and
+[installation and rollback](docs/INSTALLATION.md) for the editable settings,
+profile layout and managed-link rules.
 
 ## Development
 
