@@ -376,10 +376,29 @@ def main() -> None:
             ),
             encoding="utf-8",
         )
-        assert _read_pending_upgrade(restore_resume) == restore_resume_backup
+        restore_marker_path = restore_resume_stage / RESTORE_MARKER
+        owned_restore_marker = restore_marker_path.read_text(encoding="utf-8")
+        mismatched_restore_marker = json.loads(owned_restore_marker)
+        mismatched_restore_marker["token"] = "0" * 32
+        restore_marker_path.write_text(json.dumps(mismatched_restore_marker), encoding="utf-8")
+        pending_before = restore_resume.pending_upgrade.read_bytes()
+        receipt_before = restore_resume.receipt.read_bytes()
+        try:
+            install(restore_resume, second)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("install accepted a restore stage from another transaction")
+        assert restore_resume.pending_upgrade.read_bytes() == pending_before
+        assert restore_resume.receipt.read_bytes() == receipt_before
+        assert not restore_resume.plugin.exists()
+        assert restore_marker_path.read_text(encoding="utf-8") == json.dumps(mismatched_restore_marker)
+        restore_marker_path.write_text(owned_restore_marker, encoding="utf-8")
+        assert install(restore_resume, second)["backup"] == str(restore_resume_backup)
         assert (
             restore_resume.plugin / "extension/G-Earth-Facts.jar"
-        ).read_bytes() == b"version one"
+        ).read_bytes() == b"version two"
+        assert (restore_resume_backup / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
         assert not (restore_resume.plugin / RESTORE_MARKER).exists()
         assert not restore_resume_stage.exists()
 
@@ -428,7 +447,7 @@ def main() -> None:
 
         with patch("install_steam.shutil.copytree", side_effect=fail_restore_copy):
             try:
-                _read_pending_upgrade(partial_restore)
+                install(partial_restore, second)
             except OSError:
                 pass
             else:
@@ -436,12 +455,52 @@ def main() -> None:
         assert (partial_restore_stage / RESTORE_MARKER).is_file()
         assert partial_restore.pending_upgrade.exists()
         assert not partial_restore.plugin.exists()
-        _read_pending_upgrade(partial_restore)
+        install(partial_restore, second)
         assert (
             partial_restore.plugin / "extension/G-Earth-Facts.jar"
-        ).read_bytes() == b"version one"
+        ).read_bytes() == b"version two"
+        assert (partial_restore_backup / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
         assert not partial_restore_stage.exists()
         assert not partial_restore.pending_upgrade.exists()
+
+        unpublished_restore = make_layout(root / "unpublished-restore")
+        install(unpublished_restore, first)
+        install(unpublished_restore, second)
+        unpublished_backup = next(unpublished_restore.backup_root.iterdir())
+        shutil.rmtree(unpublished_restore.plugin)
+        unpublished_restore.pending_upgrade.write_text(
+            json.dumps({"schema": 1, "operation": "upgrade",
+                        "backup": unpublished_backup.name, "token": "f" * 32}),
+            encoding="utf-8",
+        )
+        real_rename = os.rename
+        interrupted_stages: list[Path] = []
+
+        class RestorePublicationInterrupted(BaseException):
+            pass
+
+        def interrupt_restore_publication(source, destination, *args, **kwargs):
+            if Path(destination).name == ".G-Earth-Facts.restore":
+                interrupted_stages.append(Path(source))
+                raise RestorePublicationInterrupted()
+            return real_rename(source, destination, *args, **kwargs)
+
+        with patch("install_steam.os.rename", side_effect=interrupt_restore_publication):
+            try:
+                install(unpublished_restore, second)
+            except RestorePublicationInterrupted:
+                pass
+            else:
+                raise AssertionError("restore publication interruption was not exercised")
+        assert len(interrupted_stages) == 1
+        assert interrupted_stages[0].parent == unpublished_restore.profile.parent
+        assert interrupted_stages[0].is_dir()
+        unpublished_result = install(unpublished_restore, second)
+        assert unpublished_result["backup"] == str(unpublished_backup)
+        assert (unpublished_restore.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version two"
+        assert (unpublished_backup / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+        assert interrupted_stages[0].is_dir()
+        assert not unpublished_restore.pending_upgrade.exists()
 
         recovery_collision_root = root / "recovery-destination-collision"
         recovery_collision = make_layout(recovery_collision_root)

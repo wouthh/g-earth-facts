@@ -433,7 +433,7 @@ def _restore_plugin_backup(layout: Layout, backup: Path, expected_token: str) ->
         else:
             staging = Path(
                 tempfile.mkdtemp(
-                    prefix=f".{PLUGIN_ID}.restore-stage-", dir=restore.parent
+                    prefix=f".{PLUGIN_ID}.restore-stage-", dir=layout.profile.parent
                 )
             )
             try:
@@ -759,6 +759,36 @@ def _finalize_recovered_rollback(
     layout.pending_rollback.unlink(missing_ok=True)
 
 
+def _validate_pending_restore_stage(layout: Layout, restore: Path) -> None:
+    """Admit only a transaction-owned restore stage before recovery mutates it."""
+    _require_directory(restore, "Steam restore staging directory")
+    pending = layout.pending_upgrade
+    if pending.is_symlink() or not pending.is_file():
+        raise InstallError(f"Steam restore staging has no pending upgrade: {restore}")
+    try:
+        state = json.loads(pending.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise InstallError(f"Pending upgrade marker is invalid: {pending}")
+    if (
+        not isinstance(state, dict)
+        or state.get("schema") != 1
+        or state.get("operation", "upgrade") != "upgrade"
+    ):
+        raise InstallError(f"Pending upgrade marker is invalid: {pending}")
+    backup_name = state.get("backup")
+    if not _valid_entry_name(backup_name):
+        raise InstallError(f"Pending upgrade marker has an unsafe backup: {pending}")
+    backup = layout.backup_root / backup_name
+    if not _generated_backup(backup) or not _known_plugin(backup):
+        raise InstallError(f"Pending upgrade backup is unavailable: {backup}")
+    binding = state.get("token")
+    if binding is None:
+        binding = _read_transaction_token(backup)
+    if not _valid_transaction_token(binding):
+        raise InstallError(f"Pending upgrade has an invalid transaction binding: {pending}")
+    _validate_restore_marker(restore / RESTORE_MARKER, backup, binding)
+
+
 def _preflight(
     layout: Layout,
     *,
@@ -793,6 +823,10 @@ def _preflight(
             raise InstallError(f"Steam extension-link collision: {destination}")
     managed_name = layout.plugin.name
     expected_names = {PLUGIN_DIR, managed_name, *shared_names, *managed_links}
+    restore = layout.profile_extensions / f".{PLUGIN_ID}.restore"
+    if not validate_plugin and _lexists(restore):
+        _validate_pending_restore_stage(layout, restore)
+        expected_names.add(restore.name)
     if layout.profile_extensions.is_dir():
         for child in layout.profile_extensions.iterdir():
             if child.name not in expected_names:
