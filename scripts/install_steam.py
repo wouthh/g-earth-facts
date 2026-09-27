@@ -1153,6 +1153,7 @@ def rollback(layout: Layout) -> dict[str, object]:
     layout = _absolute_layout(layout)
     _ensure_profile_isolated(layout)
     _ensure_backup_root_safe(layout)
+    _validated_backups(layout)
     _ensure_receipt_safe(layout)
     pending_managed_links = _pending_upgrade_managed_links(layout)
     _preflight(

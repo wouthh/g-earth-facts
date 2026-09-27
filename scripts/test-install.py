@@ -1332,6 +1332,22 @@ def main() -> None:
         assert foreign_entry.read_text(encoding="utf-8") == "preserve"
         assert (upgrade_backup / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
 
+        # A foreign backup entry must be rejected before upgrade recovery too.
+        foreign_entry.unlink()
+        foreign_backup = upgrade_inventory_collision.backup_root / "unrecognized-backup"
+        foreign_backup.write_text("preserve", encoding="utf-8")
+        try:
+            rollback(upgrade_inventory_collision)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback recovered an upgrade before backup validation")
+        assert not upgrade_inventory_collision.plugin.exists()
+        assert upgrade_inventory_collision.pending_upgrade.read_bytes() == collision_pending
+        assert upgrade_inventory_collision.receipt.read_bytes() == collision_receipt
+        assert foreign_backup.read_text(encoding="utf-8") == "preserve"
+        assert (upgrade_backup / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+
         missing_plugin_rollback = make_layout(root / "rollback-missing-plugin-receipt-failure")
         install(missing_plugin_rollback, first)
         install(missing_plugin_rollback, second)
