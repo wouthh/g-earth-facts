@@ -1,0 +1,1 @@
+["C:\\G-Earth\\jre\\bin\\java.exe","-Dgearthfacts.stateDir=C:\\G-Earth\\steam-profile\\AppData\\Local\\G-Earth Facts","-jar","G-Earth-Facts.jar","-p","{port}","-f","{filename}","-c","{cookie}"]
