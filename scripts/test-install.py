@@ -1306,6 +1306,60 @@ def main() -> None:
         assert collision_path.read_text(encoding="utf-8") == "preserve"
         assert recovery_link_collision.receipt.read_bytes() == collision_receipt
 
+        upgrade_inventory_collision = make_layout(root / "rollback-upgrade-inventory-collision")
+        install(upgrade_inventory_collision, first)
+        install(upgrade_inventory_collision, second)
+        upgrade_backup = next(upgrade_inventory_collision.backup_root.iterdir())
+        shutil.rmtree(upgrade_inventory_collision.plugin)
+        upgrade_inventory_collision.pending_upgrade.write_text(
+            json.dumps({"schema": 1, "operation": "upgrade",
+                        "backup": upgrade_backup.name, "token": "a" * 32}),
+            encoding="utf-8",
+        )
+        foreign_entry = upgrade_inventory_collision.profile_extensions / "Unrecorded"
+        foreign_entry.write_text("preserve", encoding="utf-8")
+        collision_receipt = upgrade_inventory_collision.receipt.read_bytes()
+        collision_pending = upgrade_inventory_collision.pending_upgrade.read_bytes()
+        try:
+            rollback(upgrade_inventory_collision)
+        except InstallError:
+            pass
+        else:
+            raise AssertionError("rollback recovered an upgrade before inventory validation")
+        assert not upgrade_inventory_collision.plugin.exists()
+        assert upgrade_inventory_collision.pending_upgrade.read_bytes() == collision_pending
+        assert upgrade_inventory_collision.receipt.read_bytes() == collision_receipt
+        assert foreign_entry.read_text(encoding="utf-8") == "preserve"
+        assert (upgrade_backup / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+
+        missing_plugin_rollback = make_layout(root / "rollback-missing-plugin-receipt-failure")
+        install(missing_plugin_rollback, first)
+        install(missing_plugin_rollback, second)
+        missing_plugin_target = next(missing_plugin_rollback.backup_root.iterdir())
+        shutil.rmtree(missing_plugin_rollback.plugin)
+        real_atomic_json = install_steam._atomic_json
+
+        def fail_missing_plugin_receipt(path, value):
+            if path == missing_plugin_rollback.receipt:
+                raise OSError("synthetic missing-plugin receipt failure")
+            return real_atomic_json(path, value)
+
+        with patch("install_steam._atomic_json", side_effect=fail_missing_plugin_receipt):
+            try:
+                rollback(missing_plugin_rollback)
+            except InstallError:
+                pass
+            else:
+                raise AssertionError("rollback hid its receipt write failure")
+        assert missing_plugin_rollback.pending_rollback.is_file()
+        assert not missing_plugin_target.exists()
+        assert (missing_plugin_rollback.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+        missing_plugin_result = rollback(missing_plugin_rollback)
+        assert missing_plugin_result["previous"] is None
+        assert not missing_plugin_rollback.pending_rollback.exists()
+        assert json.loads(missing_plugin_rollback.receipt.read_text())["rollback"] == missing_plugin_target.name
+        assert (missing_plugin_rollback.plugin / "extension/G-Earth-Facts.jar").read_bytes() == b"version one"
+
         atomic_receipt_root = root / "atomic-receipt-recovery"
         atomic_receipt = make_layout(atomic_receipt_root)
         install(atomic_receipt, first)

@@ -1154,10 +1154,15 @@ def rollback(layout: Layout) -> dict[str, object]:
     _ensure_profile_isolated(layout)
     _ensure_backup_root_safe(layout)
     _ensure_receipt_safe(layout)
-    managed_links = sorted(_read_receipt_managed_links(layout.profile))
-    _validate_managed_links(layout, set(managed_links))
+    pending_managed_links = _pending_upgrade_managed_links(layout)
+    _preflight(
+        layout,
+        validate_plugin=False,
+        additional_managed_links=pending_managed_links,
+    )
     _read_pending_upgrade(layout)
     _preflight(layout)
+    managed_links = sorted(_read_receipt_managed_links(layout.profile))
     _require_receipt_for_existing_plugin(layout)
     recovered = _read_pending_rollback(layout)
     if recovered is not None:
@@ -1182,18 +1187,19 @@ def rollback(layout: Layout) -> dict[str, object]:
             if active_token is None:
                 raise InstallError(f"Current Steam plugin has no transaction token: {layout.plugin}")
             current = _backup_name(layout.backup_root)
-            _atomic_json(
-                layout.pending_rollback,
-                {
-                    "schema": 1,
-                    "operation": "rollback",
-                    "target": target.name,
-                    "current": current.name,
-                    "targetToken": target_token,
-                    "activeToken": active_token,
-                },
-            )
-            pending_written = True
+        _atomic_json(
+            layout.pending_rollback,
+            {
+                "schema": 1,
+                "operation": "rollback",
+                "target": target.name,
+                "current": current.name if current is not None else None,
+                "targetToken": target_token,
+                "activeToken": active_token,
+            },
+        )
+        pending_written = True
+        if current is not None:
             os.replace(layout.plugin, current)
         os.replace(target, layout.plugin)
         _atomic_json(
