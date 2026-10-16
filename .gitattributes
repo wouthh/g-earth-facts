@@ -1,0 +1,2 @@
+# Helper and installer scripts are not part of the extension; keep the language bar on Java.
+scripts/** linguist-detectable=false
